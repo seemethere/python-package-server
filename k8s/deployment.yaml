@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: package-server
+  labels:
+    app: package-server
+spec:
+  # Single replica: the data volume is a ReadWriteOnce PVC, so only one pod
+  # can mount it. Multi-replica needs the planned S3 storage backend.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: package-server
+  template:
+    metadata:
+      labels:
+        app: package-server
+    spec:
+      # In-flight uploads drain on SIGTERM; kubelet SIGKILLs past the grace period.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: package-server
+          # TODO: replace REPLACE-ME with the real GHCR org/user.
+          image: ghcr.io/REPLACE-ME/python-package-server:0.1.0
+          ports:
+            - containerPort: 8000
+          env:
+            - name: STORAGE_DIR
+              value: /data
+            # NOTE: the secret key MUST be named `tokens`: the projected file
+            # /secrets/auth/tokens is read by the server as AUTH_TOKEN_FILE.
+            - name: AUTH_TOKEN_FILE
+              value: /secrets/auth/tokens
+            - name: RUST_LOG
+              value: info
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: package-server-secrets
+                  key: DATABASE_URL
+          volumeMounts:
+            - mountPath: /data
+              name: data
+            - mountPath: /secrets/auth
+              name: secrets
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: package-server-data
+        - name: secrets
+          secret:
+            secretName: package-server-secrets

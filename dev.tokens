@@ -1,0 +1,4 @@
+# DEV ONLY — never use in production.
+# Format: one `user:token` per line. `#` comments and blank lines are ignored.
+# Rotate/replace this token for any shared or production-like environment.
+dev:dev-local-token-change-me

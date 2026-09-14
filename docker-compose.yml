@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: packages
+      POSTGRES_PASSWORD: packages
+      POSTGRES_DB: packages
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U packages"]
+      interval: 5s
+      retries: 10
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgres://packages:packages@db:5432/packages
+      STORAGE_DIR: /data
+      AUTH_TOKEN_FILE: /secrets/tokens
+      RUST_LOG: info
+    volumes:
+      - ./data:/data
+      - ./dev.tokens:/secrets/tokens:ro
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

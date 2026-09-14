@@ -1,0 +1,233 @@
+# python-package-server
+
+A private Python package server (PEP 503/691 simple index + twine uploads) written in Rust, with Postgres metadata and pluggable file storage.
+
+## Features
+
+- PEP 503 HTML simple index (`/simple/`, `/simple/{project}/`) and PEP 691 JSON
+  (same URLs with `Accept: application/vnd.pypi.simple.v1+json`)
+- Authenticated file downloads (`/files/{project}/{filename}`)
+- Twine-compatible uploads via `POST /legacy/` (multipart `file_upload`)
+- Token auth (`user:token` file) on all package routes; open `/health` and `/metrics`
+- Postgres-backed project/file index; file bytes on disk (S3 backend planned)
+- Embedded SQLx migrations run automatically at startup
+- Prometheus metrics at `/metrics`, structured logging via `RUST_LOG`
+
+## Architecture
+
+Request flow:
+
+```text
+pip / uv / twine
+      │  (Bearer/basic token on package routes)
+      ▼
+  axum server ──► Postgres (project + file index)
+      │
+      └──► disk (STORAGE_DIR: file bytes)
+```
+
+Storage split:
+
+```text
++------------------+        +-------------------+
+|  Postgres        |        |  Disk (STORAGE_DIR)|
+|  project/file    |        |  wheel/sdist bytes |
+|  index + hashes  |        |  served as         |
+|  (source of      |        |  application/octet-|
+|   truth for the  |        |  stream            |
+|   index)         |        |                    |
++------------------+        +-------------------+
+         ▲                           ▲
+         └────── server ──────────────┘
+```
+
+## Quickstart (docker compose)
+
+Prerequisites: Docker with the compose plugin.
+
+```sh
+# Start Postgres + the server (builds the image on first run).
+docker compose up --build
+
+# In another terminal: health check (open endpoint, no auth needed).
+curl -s http://localhost:8000/health
+# {"status":"ok",...}
+
+# Service info.
+curl -s http://localhost:8000/
+```
+
+Build a package, then upload with twine (dev credentials: user `dev`,
+token from [dev.tokens](./dev.tokens)):
+
+```sh
+python -m build
+python -m twine upload \
+  --repository-url http://localhost:8000/legacy/ \
+  -u dev -p dev-local-token-change-me \
+  dist/*
+```
+
+Install from the private index with pip:
+
+```sh
+pip install \
+  --index-url http://dev:dev-local-token-change-me@localhost:8000/simple/ \
+  --trusted-host localhost \
+  mypackage
+```
+
+Or with uv:
+
+```sh
+export UV_INDEX_URL="http://dev:dev-local-token-change-me@localhost:8000/simple/"
+uv pip install --trusted-host localhost mypackage
+```
+
+Notes:
+
+- `--trusted-host localhost` is needed only because local dev is plain HTTP;
+  put TLS (ingress / reverse proxy) in front for anything shared.
+- `docker compose up` mounts `./data` (file bytes) and `./dev.tokens`
+  (read-only auth tokens) into the app container.
+
+## Configuration
+
+All configuration is via environment variables:
+
+| Variable          | Required | Default        | Description                                              |
+| ----------------- | -------- | -------------- | -------------------------------------------------------- |
+| `BIND_ADDR`       | No       | `0.0.0.0:8000` | Socket address to listen on.                             |
+| `DATABASE_URL`    | Yes      | —              | Postgres URL, e.g. `postgres://user:pass@db:5432/packages`. |
+| `STORAGE_BACKEND` | No       | `filesystem`   | Only `filesystem` is supported; `s3` is planned.         |
+| `STORAGE_DIR`     | No       | `/data`        | Root directory for stored file bytes.                    |
+| `AUTH_TOKEN_FILE` | Yes      | —              | Path to the token file (see Auth).                       |
+| `MAX_UPLOAD_BYTES`| No       | `1073741824`   | Max upload body in bytes (default 1 GiB).                |
+| `RUST_LOG`        | No       | `info`         | Log filter, e.g. `info`, `debug`, `warn`.                |
+
+DB migrations are embedded in the binary and run automatically at startup.
+
+## Auth
+
+Package routes (`/simple/*`, `/files/*`, `/legacy/`) require a token;
+`GET /`, `GET /health`, and `GET /metrics` are open.
+
+Token file format (path given by `AUTH_TOKEN_FILE`):
+
+```text
+# lines starting with `#` are comments; blank lines are ignored
+alice:8348f3c2-9d1a-4b7e-a5c2-9f6a1e7d0b42
+ci:7c9e6679-7425-40de-944b-e07fc1f90ae7
+```
+
+Rotation: edit the file (or replace the mounted secret) — new tokens take
+effect on the next request; no restart needed. Revoking a token is the same:
+remove its line.
+
+## API summary
+
+| Method | Path                        | Auth | Description                                              |
+| ------ | --------------------------- | ---- | -------------------------------------------------------- |
+| GET    | `/`                         | Open | Service info JSON.                                       |
+| GET    | `/health`                   | Open | `200 {"status":"ok",...}` or `503` degraded; used by container/K8s probes. |
+| GET    | `/metrics`                  | Open | Prometheus text exposition.                              |
+| GET    | `/simple/`                  | Yes  | Project list (PEP 503 HTML; PEP 691 JSON with matching `Accept`). |
+| GET    | `/simple/{project}/`        | Yes  | Project file list (PEP 503 HTML / PEP 691 JSON).         |
+| GET    | `/files/{project}/{filename}` | Yes | Download artifact bytes (`application/octet-stream`).    |
+| POST   | `/legacy/`                  | Yes  | Twine multipart `file_upload`; HTTP 200 JSON on success. |
+
+## Local development
+
+Prerequisites: Rust stable toolchain (rustup) with clippy + rustfmt.
+
+```sh
+cargo test --locked
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+Tests use an in-memory store, so no live Postgres is needed for `cargo test`.
+
+Run the server locally (needs Postgres + a token file):
+
+```sh
+export DATABASE_URL=postgres://packages:packages@localhost:5432/packages
+export AUTH_TOKEN_FILE=$PWD/dev.tokens
+export STORAGE_DIR=$PWD/data
+mkdir -p "$STORAGE_DIR"
+cargo run
+```
+
+## Kubernetes
+
+Manifests live in [k8s/](./k8s/) (Kustomize). The image defaults to
+`ghcr.io/REPLACE-ME/python-package-server:0.1.0` — replace with your registry.
+
+1. Create the real secret out-of-band (see
+   [k8s/secret.example.yaml](./k8s/secret.example.yaml); never commit it):
+
+   ```sh
+   kubectl -n packages create secret generic package-server-secrets \
+     --from-literal=DATABASE_URL='postgres://packages:PASSWORD@postgres:5432/packages' \
+     --from-file=tokens=/path/to/tokens
+   ```
+
+   The secret key MUST be named `tokens`: the deployment projects it as the
+   file `/secrets/auth/tokens`, which the server reads as `AUTH_TOKEN_FILE`.
+
+2. Deploy:
+
+   ```sh
+   kustomize build k8s | kubectl apply -f -
+   ```
+
+3. Test via port-forward:
+
+   ```sh
+   kubectl -n packages port-forward svc/package-server 8000:8000
+   curl -s http://localhost:8000/health
+   ```
+
+Notes:
+
+- Single replica: the data volume is a `ReadWriteOnce` PVC, so only one pod
+  can mount it; multi-replica needs the planned S3 backend.
+- The PVC uses the cluster default StorageClass and requests 10 Gi.
+- Probes (startup/readiness/liveness) all use `GET /health` on port 8000.
+
+## Project layout
+
+```text
+.
+├── src/
+│   ├── main.rs        # binary entrypoint (bind, migrate, serve)
+│   ├── config.rs      # env-based Settings
+│   ├── auth.rs        # token-file auth
+│   ├── db.rs          # Postgres project/file index
+│   ├── storage.rs     # file-byte storage backends (filesystem)
+│   ├── simple.rs      # PEP 503/691 index handlers
+│   ├── files.rs       # download handler
+│   ├── upload.rs      # twine legacy upload handler
+│   ├── packaging.rs   # filename/metadata parsing helpers
+│   └── error.rs       # error types
+├── migrations/        # embedded SQLx migrations (run at startup)
+├── k8s/               # Kustomize manifests + secret example
+├── Dockerfile         # multi-stage build (rust builder, slim runtime)
+├── docker-compose.yml # local Postgres + app
+├── dev.tokens         # DEV-ONLY local auth tokens
+└── .github/workflows/ci.yml
+```
+
+## Roadmap
+
+- S3-compatible storage backend (enables multi-replica)
+- Virtual/merged repos (upstream proxying)
+- Yank / delete endpoints
+- HTTP range requests for downloads
+- OIDC SSO alongside token auth
+- nginx read-through cache in front of `/files`
+
+## License
+
+Licensed under either MIT or Apache-2.0 at your option (`MIT OR Apache-2.0`,
+matching `Cargo.toml`).
