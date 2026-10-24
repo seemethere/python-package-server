@@ -35,7 +35,7 @@ services:
   # S3_ENDPOINT_URL=http://minio:9000, AWS_ACCESS_KEY_ID=minioadmin, and
   # AWS_SECRET_ACCESS_KEY=minioadmin on the app service.
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     profiles: [s3]
     command: server /data --console-address ":9001"
     environment:
@@ -48,7 +48,7 @@ services:
       - miniodata:/data
 
   minio-init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     profiles: [s3]
     depends_on:
       - minio
