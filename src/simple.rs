@@ -204,7 +204,11 @@ fn project_json(display: &str, files: &[FileRecord]) -> String {
             .iter()
             .map(|file| serde_json::json!({
                 "filename": file.filename,
-                "url": format!("/files/{}/{}", file.project, file.filename),
+                "url": format!(
+                    "/files/{}/{}",
+                    percent_encode(&file.project),
+                    percent_encode(&file.filename)
+                ),
                 "hashes": {"sha256": file.sha256},
                 "requires-python": file.requires_python,
                 "yanked": false,
@@ -347,6 +351,21 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&project_json("Demo-Pkg", &files)).unwrap();
         assert!(value["files"][0]["requires-python"].is_null());
+    }
+
+    #[test]
+    fn project_json_percent_encodes_file_urls() {
+        let mut files = files();
+        files[0].filename = "demo pkg-1.2.3.tar.gz".to_string();
+        let value: serde_json::Value =
+            serde_json::from_str(&project_json("Demo-Pkg", &files)).unwrap();
+        // The filename field stays raw; only the URL is percent-encoded,
+        // matching the HTML rendering.
+        assert_eq!(value["files"][0]["filename"], "demo pkg-1.2.3.tar.gz");
+        assert_eq!(
+            value["files"][0]["url"],
+            "/files/demo-pkg/demo%20pkg-1.2.3.tar.gz"
+        );
     }
 
     #[test]
