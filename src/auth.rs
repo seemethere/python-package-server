@@ -1,49 +1,39 @@
 //! Token authentication via HTTP Basic or Bearer [REDACTED]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use base64::Engine;
 use subtle::ConstantTimeEq;
 
 use crate::error::AppError;
 
-/// Static credential store: `users` maps user -> token, `tokens` maps token -> user.
+/// Credential store: `users` maps user -> token, `tokens` maps token -> user.
+///
+/// When built with [`Auth::from_file`], the token file's modification time
+/// is checked on every verification and credentials reload automatically
+/// after rotation, with no restart. A malformed or empty replacement file
+/// keeps the previously loaded credentials and is retried only once the
+/// file changes again. In-memory stores ([`Auth::from_pairs`]) never reload.
 #[derive(Clone, Debug)]
 pub struct Auth {
-    users: Arc<HashMap<String, String>>,
-    tokens: Arc<HashMap<String, String>>,
+    inner: Arc<RwLock<Credentials>>,
+    /// Token file to watch for rotation; `None` for in-memory credentials.
+    file: Option<Arc<std::path::PathBuf>>,
 }
 
-impl Auth {
-    /// Load `user:token` pairs from a file; blank lines and `#` comments are skipped.
-    pub fn from_file(path: &std::path::Path) -> std::io::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let mut pairs = Vec::new();
-        for (index, line) in content.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let malformed = || {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("auth token file line {} malformed", index + 1),
-                )
-            };
-            let (user, token) = line.split_once(':').ok_or_else(malformed)?;
-            let (user, token) = (user.trim(), token.trim());
-            if user.is_empty() || token.is_empty() {
-                return Err(malformed());
-            }
-            pairs.push((user.to_string(), token.to_string()));
-        }
-        Ok(Self::from_pairs(pairs))
-    }
+#[derive(Debug)]
+struct Credentials {
+    users: HashMap<String, String>,
+    tokens: HashMap<String, String>,
+    /// File mtime already loaded (or attempted); `None` when in-memory.
+    seen_mtime: Option<std::time::SystemTime>,
+}
 
-    /// Build from `(user, token)` pairs; later pairs win on duplicate users, and
-    /// the token map is rebuilt from the final user map so no stale token survives.
-    pub fn from_pairs(pairs: Vec<(String, String)>) -> Self {
+impl Credentials {
+    /// Later pairs win on duplicate users, and the token map is rebuilt from
+    /// the final user map so no stale token survives.
+    fn from_pairs(pairs: Vec<(String, String)>, seen_mtime: Option<std::time::SystemTime>) -> Self {
         let mut users = HashMap::with_capacity(pairs.len());
         for (user, token) in &pairs {
             users.insert(user.clone(), token.clone());
@@ -55,26 +45,135 @@ impl Auth {
             }
         }
         Self {
-            users: Arc::new(users),
-            tokens: Arc::new(tokens),
+            users,
+            tokens,
+            seen_mtime,
         }
+    }
+}
+
+/// Parse `user:token` lines; blank lines and `#` comments are skipped.
+fn parse_pairs(content: &str) -> std::io::Result<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let malformed = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("auth token file line {} malformed", index + 1),
+            )
+        };
+        let (user, token) = line.split_once(':').ok_or_else(malformed)?;
+        let (user, token) = (user.trim(), token.trim());
+        if user.is_empty() || token.is_empty() {
+            return Err(malformed());
+        }
+        pairs.push((user.to_string(), token.to_string()));
+    }
+    Ok(pairs)
+}
+
+fn load_pairs(path: &std::path::Path) -> std::io::Result<Vec<(String, String)>> {
+    parse_pairs(&std::fs::read_to_string(path)?)
+}
+
+impl Auth {
+    /// Load `user:token` pairs from a file and watch it for rotation.
+    pub fn from_file(path: &std::path::Path) -> std::io::Result<Self> {
+        let pairs = load_pairs(path)?;
+        let seen_mtime = std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok();
+        Ok(Self {
+            inner: Arc::new(RwLock::new(Credentials::from_pairs(pairs, seen_mtime))),
+            file: Some(Arc::new(path.to_path_buf())),
+        })
+    }
+
+    /// Build from `(user, token)` pairs held only in memory; never reloads.
+    pub fn from_pairs(pairs: Vec<(String, String)>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Credentials::from_pairs(pairs, None))),
+            file: None,
+        }
+    }
+
+    /// Reload credentials when the token file's mtime has advanced.
+    ///
+    /// Failures (file briefly missing during an atomic replace, malformed
+    /// contents, or an empty file) keep the current credentials.
+    fn maybe_reload(&self) {
+        let Some(path) = &self.file else {
+            return;
+        };
+        let Ok(mtime) = std::fs::metadata(path.as_path()).and_then(|meta| meta.modified()) else {
+            return;
+        };
+        {
+            let inner = self.inner.read().unwrap_or_else(|err| err.into_inner());
+            if inner.seen_mtime == Some(mtime) {
+                return;
+            }
+        }
+        match load_pairs(path.as_path()) {
+            Ok(pairs) if !pairs.is_empty() => {
+                let mut inner = self.inner.write().unwrap_or_else(|err| err.into_inner());
+                // Another request may have loaded this mtime first.
+                if inner.seen_mtime != Some(mtime) {
+                    *inner = Credentials::from_pairs(pairs, Some(mtime));
+                    tracing::info!("auth tokens reloaded from {}", path.display());
+                }
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "auth token reload skipped ({}): no users found; keeping current credentials",
+                    path.display()
+                );
+                self.mark_seen(mtime);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "auth token reload failed ({}): {err}; keeping current credentials",
+                    path.display()
+                );
+                self.mark_seen(mtime);
+            }
+        }
+    }
+
+    /// Record `mtime` as attempted so a bad file is not reparsed per request;
+    /// fixing the file advances its mtime and triggers a fresh attempt.
+    fn mark_seen(&self, mtime: std::time::SystemTime) {
+        let mut inner = self.inner.write().unwrap_or_else(|err| err.into_inner());
+        inner.seen_mtime = Some(mtime);
     }
 
     /// Check HTTP Basic credentials (password is the user's token).
     pub fn verify_basic(&self, user: &str, pass: &str) -> bool {
-        self.users
+        self.maybe_reload();
+        let inner = self.inner.read().unwrap_or_else(|err| err.into_inner());
+        inner
+            .users
             .get(user)
             .is_some_and(|token| ct_equal(token, pass))
     }
 
     /// Check whether a Bearer [REDACTED] is known.
     pub fn verify_bearer(&self, token: &str) -> bool {
-        self.tokens.keys().any(|known| ct_equal(known, token))
+        self.maybe_reload();
+        let inner = self.inner.read().unwrap_or_else(|err| err.into_inner());
+        inner.tokens.keys().any(|known| ct_equal(known, token))
     }
 
     /// Resolve a Bearer [REDACTED] to its user, if known.
     pub fn user_for_token(&self, token: &str) -> Option<String> {
-        self.tokens
+        self.maybe_reload();
+        let inner = self.inner.read().unwrap_or_else(|err| err.into_inner());
+        inner
+            .tokens
             .iter()
             .find(|(known, _)| ct_equal(known, token))
             .map(|(_, user)| user.clone())
@@ -82,7 +181,8 @@ impl Auth {
 
     /// Whether the store holds zero users (empty token file).
     pub fn is_empty(&self) -> bool {
-        self.users.is_empty()
+        let inner = self.inner.read().unwrap_or_else(|err| err.into_inner());
+        inner.users.is_empty()
     }
 }
 
@@ -263,5 +363,56 @@ mod tests {
             let err = Auth::from_file(file.path()).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         }
+    }
+
+    /// Rewrite a token file and force a distinct, later mtime so the reload
+    /// check observes the rotation deterministically.
+    fn rewrite_token_file(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
+
+    #[test]
+    fn reloads_rotated_token_file_without_restart() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "alice:old-token").unwrap();
+        writeln!(file, "bob:bob-token").unwrap();
+        file.flush().unwrap();
+        let auth = Auth::from_file(file.path()).unwrap();
+        assert!(auth.verify_basic("alice", "old-token"));
+
+        rewrite_token_file(file.path(), "alice:new-token\nbob:bob-token\n");
+        assert!(auth.verify_basic("alice", "new-token"));
+        assert!(!auth.verify_basic("alice", "old-token"));
+        assert!(auth.verify_bearer("new-token"));
+        assert!(!auth.verify_bearer("old-token"));
+        assert_eq!(auth.user_for_token("new-token"), Some("alice".to_string()));
+        // Untouched users survive the reload.
+        assert!(auth.verify_basic("bob", "bob-token"));
+    }
+
+    #[test]
+    fn bad_reload_keeps_current_credentials() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "alice:good-token").unwrap();
+        file.flush().unwrap();
+        let auth = Auth::from_file(file.path()).unwrap();
+
+        rewrite_token_file(file.path(), "garbage-without-colon\n");
+        assert!(auth.verify_basic("alice", "good-token"));
+
+        rewrite_token_file(file.path(), "# only comments\n");
+        assert!(auth.verify_basic("alice", "good-token"));
+
+        // Fixing the file reloads again.
+        rewrite_token_file(file.path(), "alice:fixed-token\n");
+        assert!(auth.verify_basic("alice", "fixed-token"));
+        assert!(!auth.verify_basic("alice", "good-token"));
     }
 }
