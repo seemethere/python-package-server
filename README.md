@@ -150,7 +150,7 @@ it. See the API summary below.
 | GET    | `/metrics`                  | Open | Prometheus text exposition (trusted networks only; see Auth). |
 | GET    | `/simple/`                  | Yes  | Project list (PEP 503 HTML; PEP 691 JSON with matching `Accept`). |
 | GET    | `/simple/{project}/`        | Yes  | Project file list (PEP 503 HTML / PEP 691 JSON).         |
-| GET    | `/files/{project}/{filename}` | Yes | Download artifact bytes (`application/octet-stream`).    |
+| GET    | `/files/{project}/{filename}` | Yes | Download bytes; single `Range`, `If-None-Match`, and `If-Range` supported. |
 | POST   | `/legacy/`                  | Yes  | Twine multipart `file_upload`; HTTP 200 JSON on success. |
 | POST   | `/admin/projects/{project}/files/{filename}/yank` | Owner | Yank a file (PEP 592); optional JSON `{"reason": "..."}`. |
 | POST   | `/admin/projects/{project}/files/{filename}/unyank` | Owner | Clear a file's yank. |
@@ -248,7 +248,6 @@ Notes:
 
 - S3-compatible storage backend (enables multi-replica)
 - Virtual/merged repos (upstream proxying)
-- HTTP range requests for downloads
 - OIDC SSO alongside token auth
 - nginx read-through cache in front of `/files`
 

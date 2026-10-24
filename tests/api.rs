@@ -439,6 +439,164 @@ async fn upload_happy_path_index_and_download() {
     assert_eq!(bytes, FILE_BYTES);
 }
 
+fn download_request(
+    range: Option<&str>,
+    if_none_match: Option<&str>,
+    if_range: Option<&str>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(format!("/files/{NORMALIZED}/{FILENAME}"))
+        .header(header::AUTHORIZATION, good_auth());
+    if let Some(value) = range {
+        builder = builder.header(header::RANGE, value);
+    }
+    if let Some(value) = if_none_match {
+        builder = builder.header(header::IF_NONE_MATCH, value);
+    }
+    if let Some(value) = if_range {
+        builder = builder.header(header::IF_RANGE, value);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn range_downloads_serve_single_ranges() {
+    let (app, state, _tmp) = test_app().await;
+    let body = upload_body(FILE_BYTES, None);
+    let res = app
+        .oneshot(post_upload_request(Some(good_auth()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let total = FILE_BYTES.len();
+
+    // Bounded range.
+    let res = build_router(state.clone())
+        .oneshot(download_request(Some("bytes=0-4"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        res.headers().get(header::CONTENT_RANGE).unwrap(),
+        &format!("bytes 0-4/{total}")
+    );
+    assert_eq!(res.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+    let bytes = body_bytes(res.into_body()).await;
+    assert_eq!(bytes, FILE_BYTES[0..5]);
+
+    // Open-ended and suffix ranges.
+    let res = build_router(state.clone())
+        .oneshot(download_request(Some("bytes=10-"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    let bytes = body_bytes(res.into_body()).await;
+    assert_eq!(bytes, FILE_BYTES[10..]);
+    let res = build_router(state.clone())
+        .oneshot(download_request(Some("bytes=-4"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    let bytes = body_bytes(res.into_body()).await;
+    assert_eq!(bytes, FILE_BYTES[total - 4..]);
+
+    // Out-of-range starts are unsatisfiable.
+    let res = build_router(state.clone())
+        .oneshot(download_request(Some("bytes=1000-2000"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        res.headers().get(header::CONTENT_RANGE).unwrap(),
+        &format!("bytes */{total}")
+    );
+
+    // Malformed and multipart ranges fall back to a full download.
+    for range in ["items=0-3", "bytes=abc-def", "bytes=0-1,3-4"] {
+        let res = build_router(state.clone())
+            .oneshot(download_request(Some(range), None, None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "range {range}");
+        let bytes = body_bytes(res.into_body()).await;
+        assert_eq!(bytes, FILE_BYTES, "range {range}");
+    }
+}
+
+#[tokio::test]
+async fn conditional_downloads_honor_etags() {
+    let (app, state, _tmp) = test_app().await;
+    let body = upload_body(FILE_BYTES, None);
+    let res = app
+        .oneshot(post_upload_request(Some(good_auth()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Capture the validator from a plain download.
+    let res = build_router(state.clone())
+        .oneshot(download_request(None, None, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let etag = res
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Matching If-None-Match (exact and star) yields an empty 304.
+    for value in [etag.as_str(), "*"] {
+        let res = build_router(state.clone())
+            .oneshot(download_request(None, Some(value), None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED, "value {value}");
+        assert!(body_bytes(res.into_body()).await.is_empty());
+    }
+
+    // A stale validator gets the full body.
+    let res = build_router(state.clone())
+        .oneshot(download_request(None, Some("\"stale\""), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = body_bytes(res.into_body()).await;
+    assert_eq!(bytes, FILE_BYTES);
+
+    // HEAD mirrors GET headers with no body.
+    let head = Request::builder()
+        .method("HEAD")
+        .uri(format!("/files/{NORMALIZED}/{FILENAME}"))
+        .header(header::AUTHORIZATION, good_auth())
+        .body(Body::empty())
+        .unwrap();
+    let res = build_router(state.clone()).oneshot(head).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(header::CONTENT_LENGTH).unwrap(),
+        &FILE_BYTES.len().to_string()
+    );
+    assert!(body_bytes(res.into_body()).await.is_empty());
+
+    // If-Range: fresh validator ranges, stale validator downloads fully.
+    let res = build_router(state.clone())
+        .oneshot(download_request(Some("bytes=0-4"), None, Some(&etag)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    let res = build_router(state.clone())
+        .oneshot(download_request(Some("bytes=0-4"), None, Some("\"stale\"")))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = body_bytes(res.into_body()).await;
+    assert_eq!(bytes, FILE_BYTES);
+}
+
 #[tokio::test]
 async fn reupload_conflicts_and_cleans_staging() {
     let (app, state, _tmp) = test_app().await;
