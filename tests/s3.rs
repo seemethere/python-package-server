@@ -16,7 +16,9 @@ fn test_settings(endpoint: String, staging_dir: PathBuf) -> Settings {
         storage_backend: "s3".to_string(),
         storage_dir: staging_dir,
         s3_bucket: Some(std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "pps-test".to_string())),
-        s3_region: std::env::var("TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+        s3_region: Some(
+            std::env::var("TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+        ),
         s3_endpoint_url: Some(endpoint),
         auth_token_file: PathBuf::from("/dev/null"),
         max_upload_bytes: 1024 * 1024,
@@ -31,7 +33,12 @@ async fn ensure_bucket(settings: &Settings) {
         .await;
     let client = aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::config::Builder::from(&sdk_config)
-            .region(aws_sdk_s3::config::Region::new(settings.s3_region.clone()))
+            .region(aws_sdk_s3::config::Region::new(
+                settings
+                    .s3_region
+                    .clone()
+                    .unwrap_or_else(|| "us-east-1".to_string()),
+            ))
             .endpoint_url(settings.s3_endpoint_url.clone().unwrap())
             .force_path_style(true)
             .build(),
