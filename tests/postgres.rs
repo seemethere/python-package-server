@@ -78,6 +78,41 @@ async fn postgres_metadata_roundtrip() {
     assert_eq!(got.project_display, "Ci-Pg");
     assert_eq!(got.uploaded_by, "ci");
 
+    // Yank lifecycle and ownership transfer against real Postgres.
+    assert!(!got.yanked);
+    assert_eq!(got.yank_reason, None);
+    assert!(store
+        .set_yanked(&project, &filename, true, Some("bad build"))
+        .await
+        .expect("yank file"));
+    let yanked = store
+        .get_file(&project, &filename)
+        .await
+        .expect("get yanked file")
+        .expect("file present");
+    assert!(yanked.yanked);
+    assert_eq!(yanked.yank_reason.as_deref(), Some("bad build"));
+    assert!(store
+        .set_yanked(&project, &filename, false, None)
+        .await
+        .expect("unyank file"));
+    let project_row = store
+        .get_project(&project)
+        .await
+        .expect("get project")
+        .expect("project present");
+    assert_eq!(project_row.owner.as_deref(), Some("ci"));
+    assert!(store
+        .set_project_owner(&project, "mallory")
+        .await
+        .expect("transfer project"));
+    let project_row = store
+        .get_project(&project)
+        .await
+        .expect("get transferred project")
+        .expect("project present");
+    assert_eq!(project_row.owner.as_deref(), Some("mallory"));
+
     let files = store.list_files(&project).await.expect("list files");
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].filename, filename);

@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod db;
@@ -17,7 +18,7 @@ use axum::{
     http::Request,
     middleware::{self, Next},
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 
 /// Record per-request latency and count, labelled by method/route/status.
@@ -59,7 +60,8 @@ async fn metrics_middleware(req: Request<Body>, next: Next) -> Response {
 ///
 /// Public (open): `GET /`, `/health`, `/live`, `/metrics`.
 /// Protected (token auth): `GET /simple/`, `GET /simple/{project}/`,
-/// `GET /files/{project}/{filename}`, `POST /legacy/`.
+/// `GET /files/{project}/{filename}`, `POST /legacy/`, and the
+/// owner-only `/admin/*` routes.
 pub fn build_router(state: state::AppState) -> axum::Router {
     // Auth only wraps the four package routes so unknown paths still 404
     // instead of 401; route_layer preserves that 404 behavior.
@@ -76,6 +78,22 @@ pub fn build_router(state: state::AppState) -> axum::Router {
             post(crate::upload::legacy_upload)
                 .route_layer(DefaultBodyLimit::disable())
                 .route_layer(tower::limit::ConcurrencyLimitLayer::new(8)),
+        )
+        .route(
+            "/admin/projects/{project}/files/{filename}/yank",
+            post(crate::admin::yank_file),
+        )
+        .route(
+            "/admin/projects/{project}/files/{filename}/unyank",
+            post(crate::admin::unyank_file),
+        )
+        .route(
+            "/admin/projects/{project}/files/{filename}",
+            delete(crate::admin::delete_file),
+        )
+        .route(
+            "/admin/projects/{project}/transfer",
+            post(crate::admin::transfer_project),
         )
         .route_layer(middleware::from_fn_with_state(
             state.auth.clone(),

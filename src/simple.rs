@@ -189,10 +189,27 @@ fn project_html(display: &str, files: &[FileRecord]) -> String {
                 escape(requires_python)
             ));
         }
+        if file.yanked {
+            body.push_str(&format!(
+                " data-yanked=\"{}\"",
+                escape(file.yank_reason.as_deref().unwrap_or(""))
+            ));
+        }
         body.push_str(&format!(">{}</a><br/>", escape(&file.filename)));
     }
     body.push_str(HTML_TAIL);
     body
+}
+
+/// PEP 691 yank value: `false`, `true`, or the yank reason string.
+fn yanked_value(file: &FileRecord) -> serde_json::Value {
+    if !file.yanked {
+        serde_json::Value::Bool(false)
+    } else if let Some(reason) = &file.yank_reason {
+        serde_json::Value::String(reason.clone())
+    } else {
+        serde_json::Value::Bool(true)
+    }
 }
 
 /// Render the PEP 691 per-project document.
@@ -211,7 +228,7 @@ fn project_json(display: &str, files: &[FileRecord]) -> String {
                 ),
                 "hashes": {"sha256": file.sha256},
                 "requires-python": file.requires_python,
-                "yanked": false,
+                "yanked": yanked_value(file),
                 "data-dist-info-metadata": false,
             }))
             .collect::<Vec<_>>(),
@@ -248,6 +265,8 @@ mod tests {
             size_bytes: 42,
             requires_python: Some(">=3.8".to_string()),
             uploaded_by: "alice".to_string(),
+            yanked: false,
+            yank_reason: None,
         }]
     }
 
@@ -290,6 +309,8 @@ mod tests {
             size_bytes: 42,
             requires_python: None,
             uploaded_by: "alice".to_string(),
+            yanked: false,
+            yank_reason: None,
         }];
         let html = project_html("Evil & <Pkg>", &files);
         assert!(html.contains("<h1>Evil &amp; &lt;Pkg&gt;</h1>"));
@@ -351,6 +372,36 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&project_json("Demo-Pkg", &files)).unwrap();
         assert!(value["files"][0]["requires-python"].is_null());
+    }
+
+    #[test]
+    fn renders_yanked_files() {
+        let mut files = files();
+        files[0].yanked = true;
+        files[0].yank_reason = Some("bad <build>".to_string());
+
+        let html = project_html("Demo-Pkg", &files);
+        assert!(html.contains("data-yanked=\"bad &lt;build&gt;\""), "{html}");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&project_json("Demo-Pkg", &files)).unwrap();
+        assert_eq!(value["files"][0]["yanked"], "bad <build>");
+
+        // Yanked without a reason renders as boolean true / empty attribute.
+        files[0].yank_reason = None;
+        let html = project_html("Demo-Pkg", &files);
+        assert!(html.contains("data-yanked=\"\""), "{html}");
+        let value: serde_json::Value =
+            serde_json::from_str(&project_json("Demo-Pkg", &files)).unwrap();
+        assert_eq!(value["files"][0]["yanked"], true);
+
+        // Unyanked files carry no yank marker in either format.
+        files[0].yanked = false;
+        let html = project_html("Demo-Pkg", &files);
+        assert!(!html.contains("data-yanked"), "{html}");
+        let value: serde_json::Value =
+            serde_json::from_str(&project_json("Demo-Pkg", &files)).unwrap();
+        assert_eq!(value["files"][0]["yanked"], false);
     }
 
     #[test]
