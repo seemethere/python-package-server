@@ -115,9 +115,10 @@ chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, shared config, IMDS).
 The bucket must already exist: startup verifies it with `HeadBucket` and
 exits on failure, so bad credentials, endpoints, or bucket names fail
 fast instead of erroring per request. Uploads still stage on local disk
-(`STORAGE_DIR`, 1 GiB default cap) and stream to the bucket. For local
-MinIO, `docker compose --profile s3 up minio minio-init` creates a
-`packages` bucket (see [docker-compose.yml](./docker-compose.yml)).
+(`STORAGE_DIR`, 1 GiB default cap) and stream to the bucket. For a local
+S3-compatible endpoint, `docker compose --profile s3 up s3mock` provides
+an in-memory one with a pre-created `packages` bucket (development only;
+see [docker-compose.yml](./docker-compose.yml)).
 
 ## Auth
 

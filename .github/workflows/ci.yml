@@ -33,18 +33,18 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      # MinIO for tests/s3.rs. Started with docker run (the service
-      # container cannot pass MinIO's `server` command reliably).
-      - name: Start MinIO for S3 tests
+      # S3-compatible endpoint for tests/s3.rs (Adobe S3Mock; MinIO no
+      # longer publishes pullable images). Any HTTP response means up.
+      - name: Start S3Mock for S3 tests
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:latest server /data
+          docker run -d --name s3mock -p 9000:9090 \
+            -e COM_ADOBE_TESTING_S3MOCK_STORE_INITIALBUCKETS=pps-test \
+            adobe/s3mock:latest
           for i in $(seq 1 30); do
-            curl -sf http://localhost:9000/minio/health/ready && break
+            curl -s -o /dev/null http://localhost:9000/ && break
             sleep 2
           done
+          curl -s http://localhost:9000/ | head -c 200
       - run: cargo test --locked
         env:
           TEST_DATABASE_URL: postgres://packages:packages@localhost:5432/packages
