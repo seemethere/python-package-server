@@ -221,6 +221,17 @@ async fn health_is_open() {
 }
 
 #[tokio::test]
+async fn liveness_is_open() {
+    let (app, _state, _tmp) = test_app().await;
+    let res = app.oneshot(get_request("/live", None, None)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert!(json["version"].is_string());
+}
+
+#[tokio::test]
 async fn metrics_is_open() {
     let (app, _state, _tmp) = test_app().await;
     let res = app

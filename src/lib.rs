@@ -57,7 +57,7 @@ async fn metrics_middleware(req: Request<Body>, next: Next) -> Response {
 
 /// Build the full router.
 ///
-/// Public (open): `GET /`, `/health`, `/metrics`.
+/// Public (open): `GET /`, `/health`, `/live`, `/metrics`.
 /// Protected (token auth): `GET /simple/`, `GET /simple/{project}/`,
 /// `GET /files/{project}/{filename}`, `POST /legacy/`.
 pub fn build_router(state: state::AppState) -> axum::Router {
@@ -85,6 +85,7 @@ pub fn build_router(state: state::AppState) -> axum::Router {
     axum::Router::new()
         .route("/", get(crate::health::root))
         .route("/health", get(crate::health::health))
+        .route("/live", get(crate::health::liveness))
         .route("/metrics", get(crate::health::metrics))
         .merge(protected)
         .layer(middleware::from_fn(metrics_middleware))
