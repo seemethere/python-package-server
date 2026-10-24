@@ -27,7 +27,7 @@ fn test_settings(storage_dir: PathBuf) -> Settings {
         storage_backend: "filesystem".to_string(),
         storage_dir,
         s3_bucket: None,
-        s3_region: "us-east-1".to_string(),
+        s3_region: None,
         s3_endpoint_url: None,
         auth_token_file: PathBuf::from("/dev/null"),
         max_upload_bytes: 1024 * 1024,

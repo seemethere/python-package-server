@@ -16,8 +16,9 @@ pub struct Settings {
     pub storage_dir: PathBuf,
     /// S3 bucket holding file bytes; required for the `s3` backend.
     pub s3_bucket: Option<String>,
-    /// S3 region (also used to sign requests to S3-compatible endpoints).
-    pub s3_region: String,
+    /// Explicit S3 region override; `None` lets the AWS SDK chain
+    /// (`AWS_REGION`, profile, IMDS) decide.
+    pub s3_region: Option<String>,
     /// Custom S3 endpoint (e.g. MinIO); `None` means AWS S3.
     pub s3_endpoint_url: Option<String>,
     /// Path to the auth token file (`user:token` per line, `#` comments allowed).
@@ -41,10 +42,21 @@ impl Settings {
         } else {
             None
         };
-        let s3_endpoint_url = env::var("S3_ENDPOINT_URL")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        let s3_endpoint_url = match env::var("S3_ENDPOINT_URL") {
+            Ok(value) if !value.trim().is_empty() => {
+                let value = value.trim().to_string();
+                validate_endpoint_url(&value)?;
+                Some(value)
+            }
+            _ => None,
+        };
+        let s3_region = match env::var("S3_REGION") {
+            Ok(value) if value.trim().is_empty() => {
+                return Err("env var S3_REGION must not be blank".to_string());
+            }
+            Ok(value) => Some(value.trim().to_string()),
+            Err(_) => None,
+        };
         let max_upload_bytes = parse_max_upload_bytes(&env_or("MAX_UPLOAD_BYTES", "1073741824"))?;
         Ok(Self {
             bind_addr: env_or("BIND_ADDR", "0.0.0.0:8000"),
@@ -52,7 +64,7 @@ impl Settings {
             storage_backend,
             storage_dir: PathBuf::from(env_or("STORAGE_DIR", "/data")),
             s3_bucket,
-            s3_region: env_or("S3_REGION", "us-east-1"),
+            s3_region,
             s3_endpoint_url,
             auth_token_file: PathBuf::from(required_non_blank("AUTH_TOKEN_FILE")?),
             max_upload_bytes,
@@ -71,6 +83,22 @@ fn required_non_blank(key: &str) -> Result<String, String> {
         Ok(_) => Err(format!("env var {key} must not be blank")),
         Err(_) => Err(format!("missing required env var {key}")),
     }
+}
+
+/// Require an `http`/`https` endpoint with a host, so malformed values
+/// fail at startup instead of as per-request endpoint-resolution errors.
+fn validate_endpoint_url(value: &str) -> Result<(), String> {
+    let invalid =
+        || format!("invalid S3_ENDPOINT_URL '{value}' (want http:// or https:// with a host)");
+    let rest = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+        .ok_or_else(invalid)?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() || value.chars().any(|c| c.is_whitespace()) {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// Parse the upload cap, rejecting non-numeric, zero, and over-i64 values.
@@ -97,6 +125,8 @@ mod tests {
         let saved_cap = env::var("MAX_UPLOAD_BYTES").ok();
         let saved_backend = env::var("STORAGE_BACKEND").ok();
         let saved_bucket = env::var("S3_BUCKET").ok();
+        let saved_region = env::var("S3_REGION").ok();
+        let saved_endpoint = env::var("S3_ENDPOINT_URL").ok();
 
         let restore = || {
             restore_var("DATABASE_URL", saved_db.as_deref());
@@ -104,6 +134,8 @@ mod tests {
             restore_var("MAX_UPLOAD_BYTES", saved_cap.as_deref());
             restore_var("STORAGE_BACKEND", saved_backend.as_deref());
             restore_var("S3_BUCKET", saved_bucket.as_deref());
+            restore_var("S3_REGION", saved_region.as_deref());
+            restore_var("S3_ENDPOINT_URL", saved_endpoint.as_deref());
         };
 
         // Valid baseline.
@@ -153,9 +185,30 @@ mod tests {
         env::set_var("S3_BUCKET", "  ");
         assert!(Settings::from_env().unwrap_err().contains("S3_BUCKET"));
         env::set_var("S3_BUCKET", "packages");
+        env::remove_var("S3_REGION");
+        env::remove_var("S3_ENDPOINT_URL");
         let settings = Settings::from_env().unwrap();
         assert_eq!(settings.s3_bucket.as_deref(), Some("packages"));
-        assert_eq!(settings.s3_region, "us-east-1");
+        assert_eq!(settings.s3_region, None);
+        assert_eq!(settings.s3_endpoint_url, None);
+        env::set_var("S3_REGION", "eu-west-1");
+        env::set_var("S3_ENDPOINT_URL", "http://minio:9000");
+        let settings = Settings::from_env().unwrap();
+        assert_eq!(settings.s3_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(
+            settings.s3_endpoint_url.as_deref(),
+            Some("http://minio:9000")
+        );
+        // Blank region and malformed endpoints fail fast.
+        env::set_var("S3_REGION", "  ");
+        assert!(Settings::from_env().unwrap_err().contains("S3_REGION"));
+        env::remove_var("S3_REGION");
+        for bad in ["minio:9000", "://x", "ftp://minio", "http://", "http://a b"] {
+            env::set_var("S3_ENDPOINT_URL", bad);
+            let err = Settings::from_env().unwrap_err();
+            assert!(err.contains("S3_ENDPOINT_URL"), "{bad}: {err}");
+        }
+        env::remove_var("S3_ENDPOINT_URL");
         env::set_var("STORAGE_BACKEND", "tape");
         assert!(Settings::from_env()
             .unwrap_err()

@@ -208,10 +208,12 @@ pub async fn download_file(
                 }
             };
             if served == 0 {
+                // `size` is this request's own stat, the consistent
+                // total to report when the object changed mid-flight.
                 return Ok((
                     StatusCode::RANGE_NOT_SATISFIABLE,
                     [
-                        (header::CONTENT_RANGE, format!("bytes */{total}")),
+                        (header::CONTENT_RANGE, format!("bytes */{size}")),
                         (header::ACCEPT_RANGES, "bytes".to_string()),
                     ],
                 )
