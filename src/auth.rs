@@ -184,6 +184,13 @@ impl Auth {
         let inner = self.inner.read().unwrap_or_else(|err| err.into_inner());
         inner.users.is_empty()
     }
+
+    /// Whether `user` is a known account (e.g. a valid transfer target).
+    pub fn has_user(&self, user: &str) -> bool {
+        self.maybe_reload();
+        let inner = self.inner.read().unwrap_or_else(|err| err.into_inner());
+        inner.users.contains_key(user)
+    }
 }
 
 /// Constant-time string equality; length mismatch is `false` (no panic, no leak).

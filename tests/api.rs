@@ -823,3 +823,326 @@ async fn only_project_owner_can_publish() {
     let bytes = body_bytes(res.into_body()).await;
     assert_eq!(bytes, FILE_BYTES);
 }
+
+fn admin_request(
+    method: &str,
+    uri: &str,
+    auth: Option<String>,
+    json_body: Option<String>,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(value) = auth {
+        builder = builder.header(header::AUTHORIZATION, value);
+    }
+    match json_body {
+        Some(body) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+const YANK_URI: &str = "/admin/projects/demo-pkg/files/demo-pkg-1.2.3.tar.gz/yank";
+const UNYANK_URI: &str = "/admin/projects/demo-pkg/files/demo-pkg-1.2.3.tar.gz/unyank";
+const FILE_ADMIN_URI: &str = "/admin/projects/demo-pkg/files/demo-pkg-1.2.3.tar.gz";
+const TRANSFER_URI: &str = "/admin/projects/demo-pkg/transfer";
+
+#[tokio::test]
+async fn admin_yank_unyank_delete_flow() {
+    let (app, state, _tmp) = test_app_two_users().await;
+    let alice = basic_auth("alice", "alice-token");
+    let bob = basic_auth("bob", "bob-token");
+
+    // Alice uploads and thereby owns the project.
+    let body = upload_body_for(VERSION, FILENAME, FILE_BYTES);
+    let res = app
+        .oneshot(post_upload_request(Some(alice.clone()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Non-owner cannot yank.
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            YANK_URI,
+            Some(bob.clone()),
+            Some(r#"{"reason":"broken"}"#.to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // Owner yanks with a reason.
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            YANK_URI,
+            Some(alice.clone()),
+            Some(r#"{"reason":"broken metadata"}"#.to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["yanked"], true);
+    assert_eq!(json["reason"], "broken metadata");
+
+    // The index advertises the yank to every reader, in both formats.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/simple/{NORMALIZED}/"),
+            Some(bob.clone()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["files"][0]["yanked"], "broken metadata");
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/simple/{NORMALIZED}/"),
+            Some(bob.clone()),
+            None,
+        ))
+        .await
+        .unwrap();
+    let html = body_text(res.into_body()).await;
+    assert!(html.contains("data-yanked=\"broken metadata\""), "{html}");
+
+    // Yanked files remain downloadable by direct URL (PEP 592).
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/files/{NORMALIZED}/{FILENAME}"),
+            Some(bob.clone()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Unyank restores normal state.
+    let res = build_router(state.clone())
+        .oneshot(admin_request("POST", UNYANK_URI, Some(alice.clone()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/simple/{NORMALIZED}/"),
+            Some(alice.clone()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["files"][0]["yanked"], false);
+
+    // Non-owner cannot delete; owner can. Afterwards everything 404s.
+    let res = build_router(state.clone())
+        .oneshot(admin_request("DELETE", FILE_ADMIN_URI, Some(bob), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let res = build_router(state.clone())
+        .oneshot(admin_request("DELETE", FILE_ADMIN_URI, Some(alice), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/files/{NORMALIZED}/{FILENAME}"),
+            Some(basic_auth("alice", "alice-token")),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/simple/{NORMALIZED}/"),
+            Some(basic_auth("alice", "alice-token")),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_transfer_flow() {
+    let (app, state, _tmp) = test_app_two_users().await;
+    let alice = basic_auth("alice", "alice-token");
+    let bob = basic_auth("bob", "bob-token");
+
+    let body = upload_body_for(VERSION, FILENAME, FILE_BYTES);
+    let res = app
+        .oneshot(post_upload_request(Some(alice.clone()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Unknown target users are rejected; the project stays alice's.
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            TRANSFER_URI,
+            Some(alice.clone()),
+            Some(r#"{"new_owner":"mallory"}"#.to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            TRANSFER_URI,
+            Some(alice),
+            Some(r#"{"new_owner":"bob"}"#.to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["owner"], "bob");
+
+    // The previous owner loses admin rights; the new owner has them.
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            YANK_URI,
+            Some(basic_auth("alice", "alice-token")),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let res = build_router(state.clone())
+        .oneshot(admin_request("POST", YANK_URI, Some(bob), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_not_found_and_auth() {
+    let (app, state, _tmp) = test_app_two_users().await;
+    let alice = basic_auth("alice", "alice-token");
+
+    // Unauthenticated admin calls are rejected by the auth layer.
+    let res = app
+        .oneshot(admin_request("POST", YANK_URI, None, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // Missing project 404s.
+    let res = build_router(state.clone())
+        .oneshot(admin_request("POST", YANK_URI, Some(alice.clone()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    // Existing project, missing file 404s.
+    let body = upload_body_for(VERSION, FILENAME, FILE_BYTES);
+    let res = build_router(state.clone())
+        .oneshot(post_upload_request(Some(alice.clone()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            "/admin/projects/demo-pkg/files/missing-9.9.tar.gz/yank",
+            Some(alice),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_ownerless_claim_and_body_rules() {
+    let (app, state, _tmp) = test_app_two_users().await;
+    let alice = basic_auth("alice", "alice-token");
+    let bob = basic_auth("bob", "bob-token");
+
+    // Seed a pre-ownership (ownerless) project row directly.
+    state
+        .db
+        .insert_file(&NewFile {
+            project_normalized: NORMALIZED.to_string(),
+            project_display: PROJECT.to_string(),
+            filename: FILENAME.to_string(),
+            version: VERSION.to_string(),
+            sha256: sha256_hex(FILE_BYTES),
+            size_bytes: FILE_BYTES.len() as i64,
+            requires_python: None,
+            uploaded_by: "legacy".to_string(),
+        })
+        .await
+        .unwrap();
+    let _ = app;
+
+    // First administrator (bob) claims the ownerless project by yanking.
+    let res = build_router(state.clone())
+        .oneshot(admin_request("POST", YANK_URI, Some(bob.clone()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Alice is now a non-owner: forbidden even with a malformed body,
+    // because authorization runs before body parsing.
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            YANK_URI,
+            Some(alice),
+            Some("not json".to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // The owner gets a clean 400 for malformed JSON and unknown fields.
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            YANK_URI,
+            Some(bob.clone()),
+            Some("not json".to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            YANK_URI,
+            Some(bob.clone()),
+            Some(r#"{"reasons":"typo"}"#.to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // Transferring to the current owner is a no-op and rejected.
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            TRANSFER_URI,
+            Some(bob),
+            Some(r#"{"new_owner":"bob"}"#.to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}

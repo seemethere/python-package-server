@@ -132,8 +132,13 @@ remove its line.
 Project ownership: the first user to upload a project owns it, and only
 that user may publish further files to it (`403` for everyone else).
 Downloads and index reads stay open to every authenticated user. Projects
-created before ownership was introduced are claimed by their next uploader.
-Transfer ownership with SQL: `UPDATE projects SET owner = '<user>' WHERE name = '<project>';`
+created before ownership was introduced are claimed by their next uploader
+(or by the first user to administer them via the endpoints below).
+Transfer ownership with `POST /admin/projects/{project}/transfer`
+(`{"new_owner": "<user>"}`; the target must be a known user). The owner can
+also yank or unyank a file (PEP 592; yanked files stay downloadable by
+direct URL but installers skip them unless pinned) and permanently delete
+it. See the API summary below.
 
 ## API summary
 
@@ -147,6 +152,10 @@ Transfer ownership with SQL: `UPDATE projects SET owner = '<user>' WHERE name = 
 | GET    | `/simple/{project}/`        | Yes  | Project file list (PEP 503 HTML / PEP 691 JSON).         |
 | GET    | `/files/{project}/{filename}` | Yes | Download artifact bytes (`application/octet-stream`).    |
 | POST   | `/legacy/`                  | Yes  | Twine multipart `file_upload`; HTTP 200 JSON on success. |
+| POST   | `/admin/projects/{project}/files/{filename}/yank` | Owner | Yank a file (PEP 592); optional JSON `{"reason": "..."}`. |
+| POST   | `/admin/projects/{project}/files/{filename}/unyank` | Owner | Clear a file's yank. |
+| DELETE | `/admin/projects/{project}/files/{filename}` | Owner | Permanently delete a file (row + bytes). |
+| POST   | `/admin/projects/{project}/transfer` | Owner | Transfer ownership; JSON `{"new_owner": "<user>"}`. |
 
 ## Local development
 
@@ -224,6 +233,7 @@ Notes:
 │   ├── simple.rs      # PEP 503/691 index handlers
 │   ├── files.rs       # download handler
 │   ├── upload.rs      # twine legacy upload handler
+│   ├── admin.rs       # owner-only yank/delete/transfer handlers
 │   ├── packaging.rs   # filename/metadata parsing helpers
 │   └── error.rs       # error types
 ├── migrations/        # embedded SQLx migrations (run at startup)
@@ -238,7 +248,6 @@ Notes:
 
 - S3-compatible storage backend (enables multi-replica)
 - Virtual/merged repos (upstream proxying)
-- Yank / delete endpoints
 - HTTP range requests for downloads
 - OIDC SSO alongside token auth
 - nginx read-through cache in front of `/files`

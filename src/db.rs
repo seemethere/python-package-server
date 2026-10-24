@@ -19,6 +19,9 @@ pub struct FileRecord {
     pub size_bytes: i64,
     pub requires_python: Option<String>,
     pub uploaded_by: String,
+    /// PEP 592 yank flag; yanked files remain directly downloadable.
+    pub yanked: bool,
+    pub yank_reason: Option<String>,
 }
 
 /// A project row.
@@ -83,6 +86,19 @@ pub trait MetadataStore: Clone + Send + Sync + 'static {
     ) -> Result<String, DbError>;
     async fn insert_file(&self, file: &NewFile) -> Result<(), DbError>;
     async fn delete_file(&self, project: &str, filename: &str) -> Result<(), DbError>;
+    /// Fetch one project row, including ownerless and file-less projects.
+    async fn get_project(&self, normalized: &str) -> Result<Option<ProjectRecord>, DbError>;
+    /// Set or clear a file's yank flag; returns whether the file exists.
+    /// Clearing the yank also clears the stored reason.
+    async fn set_yanked(
+        &self,
+        project: &str,
+        filename: &str,
+        yanked: bool,
+        reason: Option<&str>,
+    ) -> Result<bool, DbError>;
+    /// Replace a project's owner; returns whether the project exists.
+    async fn set_project_owner(&self, normalized: &str, new_owner: &str) -> Result<bool, DbError>;
     async fn list_projects(&self) -> Result<Vec<ProjectRecord>, DbError>;
     async fn list_files(&self, project: &str) -> Result<Vec<FileRecord>, DbError>;
     async fn get_file(&self, project: &str, filename: &str) -> Result<Option<FileRecord>, DbError>;
@@ -124,11 +140,13 @@ impl PgStore {
 }
 
 const LIST_FILES_SQL: &str = "SELECT f.project, p.display_name AS project_display, \
-    f.filename, f.version, f.sha256, f.size_bytes, f.requires_python, f.uploaded_by \
+    f.filename, f.version, f.sha256, f.size_bytes, f.requires_python, f.uploaded_by, \
+    f.yanked, f.yank_reason \
     FROM files f JOIN projects p ON p.name = f.project \
     WHERE f.project = $1 ORDER BY f.filename";
 const GET_FILE_SQL: &str = "SELECT f.project, p.display_name AS project_display, \
-    f.filename, f.version, f.sha256, f.size_bytes, f.requires_python, f.uploaded_by \
+    f.filename, f.version, f.sha256, f.size_bytes, f.requires_python, f.uploaded_by, \
+    f.yanked, f.yank_reason \
     FROM files f JOIN projects p ON p.name = f.project \
     WHERE f.project = $1 AND f.filename = $2";
 
@@ -189,6 +207,47 @@ impl MetadataStore for PgStore {
             .await
             .map_err(|err| db_err("delete file", err))?;
         Ok(())
+    }
+
+    async fn get_project(&self, normalized: &str) -> Result<Option<ProjectRecord>, DbError> {
+        sqlx::query_as::<_, ProjectRecord>(
+            "SELECT name, display_name, owner FROM projects WHERE name = $1",
+        )
+        .bind(normalized)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| db_err("get project", err))
+    }
+
+    async fn set_yanked(
+        &self,
+        project: &str,
+        filename: &str,
+        yanked: bool,
+        reason: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE files SET yanked = $3, yank_reason = $4 \
+             WHERE project = $1 AND filename = $2",
+        )
+        .bind(project)
+        .bind(filename)
+        .bind(yanked)
+        .bind(if yanked { reason } else { None })
+        .execute(&self.pool)
+        .await
+        .map_err(|err| db_err("set yanked", err))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn set_project_owner(&self, normalized: &str, new_owner: &str) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE projects SET owner = $2 WHERE name = $1")
+            .bind(normalized)
+            .bind(new_owner)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| db_err("set project owner", err))?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn list_projects(&self) -> Result<Vec<ProjectRecord>, DbError> {
@@ -253,6 +312,8 @@ struct StoredFile {
     size_bytes: i64,
     requires_python: Option<String>,
     uploaded_by: String,
+    yanked: bool,
+    yank_reason: Option<String>,
 }
 
 impl StoredFile {
@@ -266,6 +327,8 @@ impl StoredFile {
             size_bytes: self.size_bytes,
             requires_python: self.requires_python.clone(),
             uploaded_by: self.uploaded_by.clone(),
+            yanked: self.yanked,
+            yank_reason: self.yank_reason.clone(),
         }
     }
 }
@@ -358,6 +421,8 @@ impl MetadataStore for MemoryStore {
                 size_bytes: file.size_bytes,
                 requires_python: file.requires_python.clone(),
                 uploaded_by: file.uploaded_by.clone(),
+                yanked: false,
+                yank_reason: None,
             },
         );
         inner.inserted_at.insert(key, std::time::Instant::now());
@@ -370,6 +435,45 @@ impl MetadataStore for MemoryStore {
         inner.files.remove(&key);
         inner.inserted_at.remove(&key);
         Ok(())
+    }
+
+    async fn get_project(&self, normalized: &str) -> Result<Option<ProjectRecord>, DbError> {
+        let inner = self.inner.read().await;
+        Ok(inner.projects.get(normalized).map(|meta| ProjectRecord {
+            name: normalized.to_string(),
+            display_name: meta.display_name.clone(),
+            owner: meta.owner.clone(),
+        }))
+    }
+
+    async fn set_yanked(
+        &self,
+        project: &str,
+        filename: &str,
+        yanked: bool,
+        reason: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let mut inner = self.inner.write().await;
+        let key = (project.to_string(), filename.to_string());
+        let Some(file) = inner.files.get_mut(&key) else {
+            return Ok(false);
+        };
+        file.yanked = yanked;
+        file.yank_reason = if yanked {
+            reason.map(str::to_string)
+        } else {
+            None
+        };
+        Ok(true)
+    }
+
+    async fn set_project_owner(&self, normalized: &str, new_owner: &str) -> Result<bool, DbError> {
+        let mut inner = self.inner.write().await;
+        let Some(meta) = inner.projects.get_mut(normalized) else {
+            return Ok(false);
+        };
+        meta.owner = Some(new_owner.to_string());
+        Ok(true)
     }
 
     async fn list_projects(&self) -> Result<Vec<ProjectRecord>, DbError> {
@@ -460,6 +564,33 @@ impl MetadataStore for MetadataBackend {
         match self {
             Self::Postgres(store) => store.delete_file(project, filename).await,
             Self::Memory(store) => store.delete_file(project, filename).await,
+        }
+    }
+
+    async fn get_project(&self, normalized: &str) -> Result<Option<ProjectRecord>, DbError> {
+        match self {
+            Self::Postgres(store) => store.get_project(normalized).await,
+            Self::Memory(store) => store.get_project(normalized).await,
+        }
+    }
+
+    async fn set_yanked(
+        &self,
+        project: &str,
+        filename: &str,
+        yanked: bool,
+        reason: Option<&str>,
+    ) -> Result<bool, DbError> {
+        match self {
+            Self::Postgres(store) => store.set_yanked(project, filename, yanked, reason).await,
+            Self::Memory(store) => store.set_yanked(project, filename, yanked, reason).await,
+        }
+    }
+
+    async fn set_project_owner(&self, normalized: &str, new_owner: &str) -> Result<bool, DbError> {
+        match self {
+            Self::Postgres(store) => store.set_project_owner(normalized, new_owner).await,
+            Self::Memory(store) => store.set_project_owner(normalized, new_owner).await,
         }
     }
 
@@ -745,5 +876,65 @@ mod tests {
                 .unwrap(),
             "bob"
         );
+    }
+
+    #[tokio::test]
+    async fn yank_lifecycle_and_owner_transfer() {
+        let store = MemoryStore::new();
+        store
+            .claim_project("Demo-Pkg", "demo-pkg", "alice")
+            .await
+            .unwrap();
+        store
+            .insert_file(&new_file("demo-pkg", "demo-pkg-1.2.3.tar.gz"))
+            .await
+            .unwrap();
+
+        let fresh = store
+            .get_file("demo-pkg", "demo-pkg-1.2.3.tar.gz")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!fresh.yanked);
+        assert_eq!(fresh.yank_reason, None);
+
+        assert!(store
+            .set_yanked("demo-pkg", "demo-pkg-1.2.3.tar.gz", true, Some("bad build"))
+            .await
+            .unwrap());
+        let yanked = store
+            .get_file("demo-pkg", "demo-pkg-1.2.3.tar.gz")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(yanked.yanked);
+        assert_eq!(yanked.yank_reason.as_deref(), Some("bad build"));
+
+        // Unyanking clears the reason too.
+        assert!(store
+            .set_yanked("demo-pkg", "demo-pkg-1.2.3.tar.gz", false, None)
+            .await
+            .unwrap());
+        let restored = store
+            .get_file("demo-pkg", "demo-pkg-1.2.3.tar.gz")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!restored.yanked);
+        assert_eq!(restored.yank_reason, None);
+
+        // Missing rows report false instead of erroring.
+        assert!(!store
+            .set_yanked("demo-pkg", "missing.whl", true, None)
+            .await
+            .unwrap());
+        assert!(!store.set_project_owner("missing", "bob").await.unwrap());
+        assert!(store.get_project("missing").await.unwrap().is_none());
+
+        let project = store.get_project("demo-pkg").await.unwrap().unwrap();
+        assert_eq!(project.owner.as_deref(), Some("alice"));
+        assert!(store.set_project_owner("demo-pkg", "bob").await.unwrap());
+        let project = store.get_project("demo-pkg").await.unwrap().unwrap();
+        assert_eq!(project.owner.as_deref(), Some("bob"));
     }
 }
