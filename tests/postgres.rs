@@ -40,15 +40,22 @@ async fn postgres_metadata_roundtrip() {
     let project = unique_project();
     let filename = format!("{project}-1.2.3.tar.gz");
 
-    store
-        .upsert_project("Ci-Pg", &project)
-        .await
-        .expect("upsert project");
-    // Re-upserting is a no-op and keeps the first display name.
-    store
-        .upsert_project("Other", &project)
-        .await
-        .expect("re-upsert project");
+    // First claim creates the project owned by "ci"; a second claim by
+    // another user returns the existing owner and keeps the display name.
+    assert_eq!(
+        store
+            .claim_project("Ci-Pg", &project, "ci")
+            .await
+            .expect("claim project"),
+        "ci"
+    );
+    assert_eq!(
+        store
+            .claim_project("Other", &project, "mallory")
+            .await
+            .expect("re-claim project"),
+        "ci"
+    );
 
     store
         .insert_file(&new_file(&project, &filename))
