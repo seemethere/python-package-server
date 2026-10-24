@@ -50,7 +50,17 @@ impl S3Backend {
         let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .load()
             .await;
-        let mut builder = aws_sdk_s3::config::Builder::from(&sdk_config);
+        let mut builder = aws_sdk_s3::config::Builder::from(&sdk_config)
+            // Integrity is anchored in the SHA-256 stored in Postgres
+            // (and verified by installers), so skip SDK object checksums:
+            // opportunistic response validation breaks ranged reads
+            // against endpoints that return full-object checksums.
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            );
         // Only an explicit S3_REGION overrides the SDK-resolved region.
         if let Some(region) = &settings.s3_region {
             builder = builder.region(aws_sdk_s3::config::Region::new(region.clone()));
