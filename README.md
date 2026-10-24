@@ -135,7 +135,8 @@ Transfer ownership with SQL: `UPDATE projects SET owner = '<user>' WHERE name = 
 | Method | Path                        | Auth | Description                                              |
 | ------ | --------------------------- | ---- | -------------------------------------------------------- |
 | GET    | `/`                         | Open | Service info JSON.                                       |
-| GET    | `/health`                   | Open | `200 {"status":"ok",...}` or `503` degraded; used by container/K8s probes. |
+| GET    | `/health`                   | Open | Readiness: `200 {"status":"ok",...}` or `503` degraded when a dependency is down. |
+| GET    | `/live`                     | Open | Liveness: always `200` while the process serves HTTP; no dependency checks. |
 | GET    | `/metrics`                  | Open | Prometheus text exposition.                              |
 | GET    | `/simple/`                  | Yes  | Project list (PEP 503 HTML; PEP 691 JSON with matching `Accept`). |
 | GET    | `/simple/{project}/`        | Yes  | Project file list (PEP 503 HTML / PEP 691 JSON).         |
@@ -202,7 +203,8 @@ Notes:
 - Single replica: the data volume is a `ReadWriteOnce` PVC, so only one pod
   can mount it; multi-replica needs the planned S3 backend.
 - The PVC uses the cluster default StorageClass and requests 10 Gi.
-- Probes (startup/readiness/liveness) all use `GET /health` on port 8000.
+- Probes: startup/readiness use deep `GET /health`; liveness uses shallow
+  `GET /live` so a database outage marks the pod unready without restarting it.
 
 ## Project layout
 

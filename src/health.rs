@@ -9,7 +9,24 @@ use axum::{
 
 use crate::{db::MetadataStore, state::AppState};
 
-/// Liveness/readiness probe: 200 when both deps are up, else 503 degraded.
+/// Liveness probe: 200 whenever the process serves HTTP.
+///
+/// Deliberately checks no dependencies, so a Postgres or storage outage
+/// marks the pod unready via [`health`] instead of restart-looping it.
+/// Wire Kubernetes `livenessProbe` here and `startupProbe`/`readinessProbe`
+/// to `/health`.
+pub async fn liveness() -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
+        .into_response()
+}
+
+/// Readiness probe: 200 when both deps are up, else 503 degraded.
 pub async fn health(State(state): State<AppState>) -> Response {
     let (db_result, storage_result) =
         tokio::join!(state.db.health_check(), state.storage.health_check());
@@ -56,6 +73,7 @@ pub async fn root() -> Json<serde_json::Value> {
         "endpoints": [
             "/",
             "/health",
+            "/live",
             "/metrics",
             "/simple/",
             "/simple/{project}/",
