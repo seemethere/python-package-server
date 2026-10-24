@@ -1,0 +1,45 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: packages
+resources:
+  - ../../base
+# S3 overlay: file bytes live in a bucket, so pods scale past one
+# replica and the ReadWriteOnce PVC goes away (STORAGE_DIR becomes
+# per-pod upload staging on emptyDir). Before applying:
+# - replace REPLACE-ME-BUCKET below with the real bucket name;
+# - for S3-compatible endpoints (MinIO), add an env entry
+#   S3_ENDPOINT_URL=http://minio:9000 to the container;
+# - provide credentials via the secret (AWS_ACCESS_KEY_ID /
+#   AWS_SECRET_ACCESS_KEY env entries) or your platform's IAM role.
+patches:
+  - target:
+      kind: Deployment
+      name: package-server
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: STORAGE_BACKEND
+          value: s3
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: S3_BUCKET
+          value: REPLACE-ME-BUCKET
+      - op: replace
+        path: /spec/template/spec/volumes/0
+        value:
+          name: data
+          emptyDir: {}
+  - target:
+      kind: PersistentVolumeClaim
+      name: package-server-data
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: package-server-data

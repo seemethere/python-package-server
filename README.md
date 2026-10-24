@@ -9,7 +9,7 @@ A private Python package server (PEP 503/691 simple index + twine uploads) writt
 - Authenticated file downloads (`/files/{project}/{filename}`)
 - Twine-compatible uploads via `POST /legacy/` (multipart `file_upload`)
 - Token auth (`user:token` file) on all package routes; open `/health` and `/metrics`
-- Postgres-backed project/file index; file bytes on disk (S3 backend planned)
+- Postgres-backed project/file index; file bytes on disk or in S3-compatible storage
 - Embedded SQLx migrations run automatically at startup
 - Prometheus metrics at `/metrics`, structured logging via `RUST_LOG`
 
@@ -99,13 +99,25 @@ All configuration is via environment variables:
 | ----------------- | -------- | -------------- | -------------------------------------------------------- |
 | `BIND_ADDR`       | No       | `0.0.0.0:8000` | Socket address to listen on.                             |
 | `DATABASE_URL`    | Yes      | —              | Postgres URL, e.g. `postgres://user:pass@db:5432/packages`. |
-| `STORAGE_BACKEND` | No       | `filesystem`   | Only `filesystem` is supported; `s3` is planned.         |
-| `STORAGE_DIR`     | No       | `/data`        | Root directory for stored file bytes.                    |
+| `STORAGE_BACKEND` | No       | `filesystem`   | `filesystem` or `s3`.                                    |
+| `STORAGE_DIR`     | No       | `/data`        | Filesystem root; for `s3`, the local upload staging dir. |
+| `S3_BUCKET`       | S3 only  | —              | Bucket holding file bytes under `{project}/{filename}` keys. |
+| `S3_REGION`       | No       | SDK chain      | Region override; unset uses `AWS_REGION`/profile/IMDS.   |
+| `S3_ENDPOINT_URL` | No       | AWS S3         | S3-compatible endpoint, e.g. `http://minio:9000`.        |
 | `AUTH_TOKEN_FILE` | Yes      | —              | Path to the token file (see Auth).                       |
 | `MAX_UPLOAD_BYTES`| No       | `1073741824`   | Max upload body in bytes (default 1 GiB).                |
 | `RUST_LOG`        | No       | `info`         | Log filter, e.g. `info`, `debug`, `warn`.                |
 
 DB migrations are embedded in the binary and run automatically at startup.
+
+With `STORAGE_BACKEND=s3`, credentials come from the standard AWS SDK
+chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, shared config, IMDS).
+The bucket must already exist: startup verifies it with `HeadBucket` and
+exits on failure, so bad credentials, endpoints, or bucket names fail
+fast instead of erroring per request. Uploads still stage on local disk
+(`STORAGE_DIR`, 1 GiB default cap) and stream to the bucket. For local
+MinIO, `docker compose --profile s3 up minio minio-init` creates a
+`packages` bucket (see [docker-compose.yml](./docker-compose.yml)).
 
 ## Auth
 
@@ -214,9 +226,12 @@ Manifests live in [k8s/](./k8s/) (Kustomize). The image defaults to
 
 Notes:
 
-- Single replica: the data volume is a `ReadWriteOnce` PVC, so only one pod
-  can mount it; multi-replica needs the planned S3 backend.
-- The PVC uses the cluster default StorageClass and requests 10 Gi.
+- Single replica with the default filesystem backend: the data volume is
+  a `ReadWriteOnce` PVC, so only one pod can mount it. The PVC uses the
+  cluster default StorageClass and requests 10 Gi.
+- For S3-backed storage, build `k8s/overlays/s3` instead: 2 replicas, no
+  PVC (staging is per-pod `emptyDir`), `STORAGE_BACKEND=s3`. Set the real
+  bucket name in the overlay first (see its comments).
 - Probes: startup/readiness use deep `GET /health`; liveness uses shallow
   `GET /live` so a database outage marks the pod unready without restarting it.
 
@@ -229,7 +244,8 @@ Notes:
 │   ├── config.rs      # env-based Settings
 │   ├── auth.rs        # token-file auth
 │   ├── db.rs          # Postgres project/file index
-│   ├── storage.rs     # file-byte storage backends (filesystem)
+│   ├── storage.rs     # file-byte storage dispatch + filesystem backend
+│   ├── s3.rs          # S3-compatible storage backend
 │   ├── simple.rs      # PEP 503/691 index handlers
 │   ├── files.rs       # download handler
 │   ├── upload.rs      # twine legacy upload handler
@@ -246,7 +262,6 @@ Notes:
 
 ## Roadmap
 
-- S3-compatible storage backend (enables multi-replica)
 - Virtual/merged repos (upstream proxying)
 - OIDC SSO alongside token auth
 - nginx read-through cache in front of `/files`
