@@ -21,7 +21,7 @@ pub enum StorageError {
 }
 
 impl StorageError {
-    fn io<E: std::fmt::Display>(what: &str, err: E) -> Self {
+    pub(crate) fn io<E: std::fmt::Display>(what: &str, err: E) -> Self {
         Self::Io(format!("{what}: {err}"))
     }
 }
@@ -35,7 +35,7 @@ impl From<StorageError> for AppError {
     }
 }
 
-fn bad_segment(s: &str) -> bool {
+pub(crate) fn bad_segment(s: &str) -> bool {
     s.is_empty()
         || s == "."
         || s == ".."
@@ -77,10 +77,11 @@ pub trait StorageBackend: Clone + Send + Sync + 'static {
     async fn health_check(&self) -> Result<(), StorageError>;
 }
 
-/// Backend dispatch. New backends (S3) add a variant here without touching routes.
+/// Backend dispatch. New backends add a variant here without touching routes.
 #[derive(Debug, Clone)]
 pub enum Storage {
     Filesystem(FsBackend),
+    S3(crate::s3::S3Backend),
 }
 
 impl Storage {
@@ -88,26 +89,33 @@ impl Storage {
         Self::Filesystem(FsBackend::new(root))
     }
 
-    pub async fn ensure_dirs(&self) -> Result<(), StorageError> {
+    pub fn s3(backend: crate::s3::S3Backend) -> Self {
+        Self::S3(backend)
+    }
+
+    /// Local staging backend. Every backend stages uploads on local disk
+    /// first, so staging operations always land here.
+    fn staging(&self) -> &FsBackend {
         match self {
-            Self::Filesystem(fs) => fs.ensure_dirs().await,
+            Self::Filesystem(fs) => fs,
+            Self::S3(s3) => s3.staging(),
         }
+    }
+
+    pub async fn ensure_dirs(&self) -> Result<(), StorageError> {
+        self.staging().ensure_dirs().await
     }
 
     /// Unique staging path for an in-progress upload.
     pub fn stage_path(&self) -> Result<PathBuf, StorageError> {
-        match self {
-            Self::Filesystem(fs) => Ok(fs.stage_path()),
-        }
+        Ok(self.staging().stage_path())
     }
 
     /// Create a new staging file with [`tokio::fs::OpenOptions::create_new`],
     /// retrying with a fresh [`Self::stage_path`] on [`std::io::ErrorKind::AlreadyExists`]
     /// (up to ~100 tries) so colliding cross-process names never truncate a peer.
     pub async fn create_staging_file(&self) -> Result<(PathBuf, tokio::fs::File), StorageError> {
-        match self {
-            Self::Filesystem(fs) => fs.create_staging_file().await,
-        }
+        self.staging().create_staging_file().await
     }
 
     /// Remove staging files older than `max_age`; returns the removal count.
@@ -116,9 +124,7 @@ impl Storage {
         &self,
         max_age: std::time::Duration,
     ) -> Result<usize, StorageError> {
-        match self {
-            Self::Filesystem(fs) => fs.sweep_staging_older_than(max_age),
-        }
+        self.staging().sweep_staging_older_than(max_age)
     }
 
     pub async fn put_file(
@@ -129,6 +135,7 @@ impl Storage {
     ) -> Result<u64, StorageError> {
         match self {
             Self::Filesystem(fs) => fs.put_file(project, filename, src).await,
+            Self::S3(s3) => s3.put_file(project, filename, src).await,
         }
     }
 
@@ -139,6 +146,7 @@ impl Storage {
     ) -> Result<Option<(u64, Body)>, StorageError> {
         match self {
             Self::Filesystem(fs) => fs.get(project, filename).await,
+            Self::S3(s3) => s3.get(project, filename).await,
         }
     }
 
@@ -151,24 +159,28 @@ impl Storage {
     ) -> Result<Option<(u64, u64, Body)>, StorageError> {
         match self {
             Self::Filesystem(fs) => fs.get_range(project, filename, start, len).await,
+            Self::S3(s3) => s3.get_range(project, filename, start, len).await,
         }
     }
 
     pub async fn stat(&self, project: &str, filename: &str) -> Result<Option<u64>, StorageError> {
         match self {
             Self::Filesystem(fs) => fs.stat(project, filename).await,
+            Self::S3(s3) => s3.stat(project, filename).await,
         }
     }
 
     pub async fn delete(&self, project: &str, filename: &str) -> Result<(), StorageError> {
         match self {
             Self::Filesystem(fs) => fs.delete(project, filename).await,
+            Self::S3(s3) => s3.delete(project, filename).await,
         }
     }
 
     pub async fn health_check(&self) -> Result<(), StorageError> {
         match self {
             Self::Filesystem(fs) => fs.health_check().await,
+            Self::S3(s3) => s3.health_check().await,
         }
     }
 }

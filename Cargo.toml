@@ -11,6 +11,8 @@ name = "python-package-server"
 path = "src/main.rs"
 
 [dependencies]
+aws-config = "1"
+aws-sdk-s3 = "1"
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
 bytes = "1"

@@ -9,10 +9,17 @@ pub struct Settings {
     pub bind_addr: String,
     /// Postgres connection string, e.g. `postgres://user:pass@db:5432/packages`.
     pub database_url: String,
-    /// Storage backend selector. Only `filesystem` in this release; `s3` is planned.
+    /// Storage backend selector: `filesystem` or `s3`.
     pub storage_backend: String,
-    /// Root directory for the filesystem backend (also stages temp uploads).
+    /// Root directory for the filesystem backend. For `s3` this is the
+    /// local staging directory uploads are buffered in before transfer.
     pub storage_dir: PathBuf,
+    /// S3 bucket holding file bytes; required for the `s3` backend.
+    pub s3_bucket: Option<String>,
+    /// S3 region (also used to sign requests to S3-compatible endpoints).
+    pub s3_region: String,
+    /// Custom S3 endpoint (e.g. MinIO); `None` means AWS S3.
+    pub s3_endpoint_url: Option<String>,
     /// Path to the auth token file (`user:token` per line, `#` comments allowed).
     pub auth_token_file: PathBuf,
     /// Maximum accepted upload body in bytes.
@@ -22,17 +29,31 @@ pub struct Settings {
 impl Settings {
     pub fn from_env() -> Result<Self, String> {
         let storage_backend = env_or("STORAGE_BACKEND", "filesystem");
-        if storage_backend != "filesystem" {
+        if storage_backend != "filesystem" && storage_backend != "s3" {
             return Err(format!(
-                "unsupported STORAGE_BACKEND '{storage_backend}' (supported: filesystem; s3 is planned)"
+                "unsupported STORAGE_BACKEND '{storage_backend}' (supported: filesystem, s3)"
             ));
         }
+        // The bucket is the only S3 setting without a usable default;
+        // region/endpoint/credentials follow AWS SDK conventions.
+        let s3_bucket = if storage_backend == "s3" {
+            Some(required_non_blank("S3_BUCKET")?)
+        } else {
+            None
+        };
+        let s3_endpoint_url = env::var("S3_ENDPOINT_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let max_upload_bytes = parse_max_upload_bytes(&env_or("MAX_UPLOAD_BYTES", "1073741824"))?;
         Ok(Self {
             bind_addr: env_or("BIND_ADDR", "0.0.0.0:8000"),
             database_url: required_non_blank("DATABASE_URL")?,
             storage_backend,
             storage_dir: PathBuf::from(env_or("STORAGE_DIR", "/data")),
+            s3_bucket,
+            s3_region: env_or("S3_REGION", "us-east-1"),
+            s3_endpoint_url,
             auth_token_file: PathBuf::from(required_non_blank("AUTH_TOKEN_FILE")?),
             max_upload_bytes,
         })
@@ -74,11 +95,15 @@ mod tests {
         let saved_db = env::var("DATABASE_URL").ok();
         let saved_auth = env::var("AUTH_TOKEN_FILE").ok();
         let saved_cap = env::var("MAX_UPLOAD_BYTES").ok();
+        let saved_backend = env::var("STORAGE_BACKEND").ok();
+        let saved_bucket = env::var("S3_BUCKET").ok();
 
         let restore = || {
             restore_var("DATABASE_URL", saved_db.as_deref());
             restore_var("AUTH_TOKEN_FILE", saved_auth.as_deref());
             restore_var("MAX_UPLOAD_BYTES", saved_cap.as_deref());
+            restore_var("STORAGE_BACKEND", saved_backend.as_deref());
+            restore_var("S3_BUCKET", saved_bucket.as_deref());
         };
 
         // Valid baseline.
@@ -120,6 +145,22 @@ mod tests {
         env::remove_var("DATABASE_URL");
         assert!(Settings::from_env().unwrap_err().contains("DATABASE_URL"));
         env::set_var("DATABASE_URL", "postgres://localhost/packages");
+
+        // The s3 backend requires a bucket and rejects unknown backends.
+        env::set_var("STORAGE_BACKEND", "s3");
+        env::remove_var("S3_BUCKET");
+        assert!(Settings::from_env().unwrap_err().contains("S3_BUCKET"));
+        env::set_var("S3_BUCKET", "  ");
+        assert!(Settings::from_env().unwrap_err().contains("S3_BUCKET"));
+        env::set_var("S3_BUCKET", "packages");
+        let settings = Settings::from_env().unwrap();
+        assert_eq!(settings.s3_bucket.as_deref(), Some("packages"));
+        assert_eq!(settings.s3_region, "us-east-1");
+        env::set_var("STORAGE_BACKEND", "tape");
+        assert!(Settings::from_env()
+            .unwrap_err()
+            .contains("STORAGE_BACKEND"));
+        env::remove_var("STORAGE_BACKEND");
 
         restore();
         assert!(Settings::from_env().is_err() || saved_db.is_some());

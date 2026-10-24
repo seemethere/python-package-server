@@ -45,7 +45,16 @@ async fn main() {
     }
     let db = MetadataBackend::Postgres(pg);
 
-    let storage = Storage::filesystem(settings.storage_dir.clone());
+    let storage = match settings.storage_backend.as_str() {
+        "s3" => match python_package_server::s3::S3Backend::from_settings(&settings).await {
+            Ok(backend) => Storage::s3(backend),
+            Err(err) => {
+                eprintln!("storage initialization failed: {err}");
+                std::process::exit(1);
+            }
+        },
+        _ => Storage::filesystem(settings.storage_dir.clone()),
+    };
     if let Err(err) = storage.ensure_dirs().await {
         eprintln!("storage initialization failed: {err}");
         std::process::exit(1);
