@@ -9,6 +9,23 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Real Postgres for tests/postgres.rs (PgStore, migrations, conflicts).
+    # Without TEST_DATABASE_URL those tests skip, so local `cargo test`
+    # still needs no database.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: packages
+          POSTGRES_PASSWORD: packages
+          POSTGRES_DB: packages
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U packages"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -16,8 +33,9 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      # Unit/integration tests use an in-memory store — no live Postgres needed.
       - run: cargo test --locked
+        env:
+          TEST_DATABASE_URL: postgres://packages:packages@localhost:5432/packages
 
   docker:
     runs-on: ubuntu-latest

@@ -26,6 +26,8 @@ pub struct FileRecord {
 pub struct ProjectRecord {
     pub name: String,
     pub display_name: String,
+    /// User allowed to publish files; `None` until first claimed.
+    pub owner: Option<String>,
 }
 
 /// A file to insert; `project_display` seeds the project row on first use.
@@ -66,7 +68,19 @@ fn db_err<E: std::fmt::Display>(what: &str, err: E) -> DbError {
 // Intentional native async fn: trait is crate-internal with Send+Sync supertraits.
 #[allow(async_fn_in_trait)]
 pub trait MetadataStore: Clone + Send + Sync + 'static {
-    async fn upsert_project(&self, display_name: &str, normalized: &str) -> Result<(), DbError>;
+    /// Ensure the project exists and return its owner's username.
+    ///
+    /// Creates the project owned by `owner` when absent, and claims it for
+    /// `owner` when it exists without one (projects predating ownership).
+    /// An already-owned project keeps its owner; callers compare the
+    /// returned owner against the acting user to authorize publishing.
+    /// Implementations must make the claim atomic.
+    async fn claim_project(
+        &self,
+        display_name: &str,
+        normalized: &str,
+        owner: &str,
+    ) -> Result<String, DbError>;
     async fn insert_file(&self, file: &NewFile) -> Result<(), DbError>;
     async fn delete_file(&self, project: &str, filename: &str) -> Result<(), DbError>;
     async fn list_projects(&self) -> Result<Vec<ProjectRecord>, DbError>;
@@ -119,17 +133,27 @@ const GET_FILE_SQL: &str = "SELECT f.project, p.display_name AS project_display,
     WHERE f.project = $1 AND f.filename = $2";
 
 impl MetadataStore for PgStore {
-    async fn upsert_project(&self, display_name: &str, normalized: &str) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO projects (name, display_name) VALUES ($1, $2) \
-             ON CONFLICT (name) DO NOTHING",
+    async fn claim_project(
+        &self,
+        display_name: &str,
+        normalized: &str,
+        owner: &str,
+    ) -> Result<String, DbError> {
+        // One atomic statement: insert owned, claim when ownerless, else
+        // return the existing owner unchanged (display name is first-wins).
+        let (final_owner,): (String,) = sqlx::query_as(
+            "INSERT INTO projects (name, display_name, owner) VALUES ($1, $2, $3) \
+             ON CONFLICT (name) DO UPDATE \
+             SET owner = COALESCE(projects.owner, EXCLUDED.owner) \
+             RETURNING owner",
         )
         .bind(normalized)
         .bind(display_name)
-        .execute(&self.pool)
+        .bind(owner)
+        .fetch_one(&self.pool)
         .await
-        .map_err(|err| db_err("upsert project", err))?;
-        Ok(())
+        .map_err(|err| db_err("claim project", err))?;
+        Ok(final_owner)
     }
 
     async fn insert_file(&self, file: &NewFile) -> Result<(), DbError> {
@@ -169,7 +193,7 @@ impl MetadataStore for PgStore {
 
     async fn list_projects(&self) -> Result<Vec<ProjectRecord>, DbError> {
         sqlx::query_as::<_, ProjectRecord>(
-            "SELECT p.name, p.display_name FROM projects p \
+            "SELECT p.name, p.display_name, p.owner FROM projects p \
              WHERE EXISTS (SELECT 1 FROM files f WHERE f.project = p.name) \
              ORDER BY p.name",
         )
@@ -246,10 +270,17 @@ impl StoredFile {
     }
 }
 
+/// Per-project metadata: first-seen display name plus publishing owner.
+#[derive(Clone, Debug)]
+struct ProjectMeta {
+    display_name: String,
+    owner: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Inner {
-    /// Normalized project name -> first-seen display name.
-    projects: HashMap<String, String>,
+    /// Normalized project name -> metadata.
+    projects: HashMap<String, ProjectMeta>,
     files: HashMap<(String, String), StoredFile>,
     /// Insertion time per file, backing orphan-candidate age checks.
     inserted_at: HashMap<(String, String), std::time::Instant>,
@@ -276,14 +307,24 @@ impl Default for MemoryStore {
 }
 
 impl MetadataStore for MemoryStore {
-    async fn upsert_project(&self, display_name: &str, normalized: &str) -> Result<(), DbError> {
-        self.inner
-            .write()
-            .await
+    async fn claim_project(
+        &self,
+        display_name: &str,
+        normalized: &str,
+        owner: &str,
+    ) -> Result<String, DbError> {
+        // The write lock makes check-and-claim atomic, matching Postgres.
+        let mut inner = self.inner.write().await;
+        let meta = inner
             .projects
             .entry(normalized.to_string())
-            .or_insert_with(|| display_name.to_string());
-        Ok(())
+            .or_insert_with(|| ProjectMeta {
+                display_name: display_name.to_string(),
+                owner: None,
+            });
+        // First display name wins, matching the Postgres claim.
+        let final_owner = meta.owner.get_or_insert_with(|| owner.to_string());
+        Ok(final_owner.clone())
     }
 
     async fn insert_file(&self, file: &NewFile) -> Result<(), DbError> {
@@ -295,11 +336,16 @@ impl MetadataStore for MemoryStore {
                 file.project_normalized, file.filename
             )));
         }
-        // First display name wins, matching the Postgres upsert.
+        // First display name wins, matching the Postgres claim. Files
+        // inserted directly (tests, seeding) leave the project ownerless.
         let display = inner
             .projects
             .entry(file.project_normalized.clone())
-            .or_insert_with(|| file.project_display.clone())
+            .or_insert_with(|| ProjectMeta {
+                display_name: file.project_display.clone(),
+                owner: None,
+            })
+            .display_name
             .clone();
         inner.files.insert(
             key.clone(),
@@ -332,9 +378,10 @@ impl MetadataStore for MemoryStore {
             .projects
             .iter()
             .filter(|(name, _)| inner.files.keys().any(|(project, _)| project == *name))
-            .map(|(name, display_name)| ProjectRecord {
+            .map(|(name, meta)| ProjectRecord {
                 name: name.clone(),
-                display_name: display_name.clone(),
+                display_name: meta.display_name.clone(),
+                owner: meta.owner.clone(),
             })
             .collect();
         projects.sort_by(|a, b| a.name.cmp(&b.name));
@@ -390,10 +437,15 @@ pub enum MetadataBackend {
 }
 
 impl MetadataStore for MetadataBackend {
-    async fn upsert_project(&self, display_name: &str, normalized: &str) -> Result<(), DbError> {
+    async fn claim_project(
+        &self,
+        display_name: &str,
+        normalized: &str,
+        owner: &str,
+    ) -> Result<String, DbError> {
         match self {
-            Self::Postgres(store) => store.upsert_project(display_name, normalized).await,
-            Self::Memory(store) => store.upsert_project(display_name, normalized).await,
+            Self::Postgres(store) => store.claim_project(display_name, normalized, owner).await,
+            Self::Memory(store) => store.claim_project(display_name, normalized, owner).await,
         }
     }
 
@@ -470,8 +522,14 @@ mod tests {
     #[tokio::test]
     async fn first_display_name_wins() {
         let store = MemoryStore::new();
-        store.upsert_project("Demo-Pkg", "demo-pkg").await.unwrap();
-        store.upsert_project("Other", "demo-pkg").await.unwrap();
+        store
+            .claim_project("Demo-Pkg", "demo-pkg", "alice")
+            .await
+            .unwrap();
+        store
+            .claim_project("Other", "demo-pkg", "bob")
+            .await
+            .unwrap();
         store
             .insert_file(&new_file("demo-pkg", "demo-pkg-1.2.3.tar.gz"))
             .await
@@ -484,7 +542,10 @@ mod tests {
     #[tokio::test]
     async fn list_projects_skips_empty_projects() {
         let store = MemoryStore::new();
-        store.upsert_project("Empty", "empty").await.unwrap();
+        store
+            .claim_project("Empty", "empty", "alice")
+            .await
+            .unwrap();
         assert!(store.list_projects().await.unwrap().is_empty());
         store
             .insert_file(&new_file("demo-pkg", "demo-pkg-1.2.3.tar.gz"))
@@ -527,7 +588,10 @@ mod tests {
     #[tokio::test]
     async fn insert_get_and_list_files() {
         let store = MemoryStore::new();
-        store.upsert_project("Demo-Pkg", "demo-pkg").await.unwrap();
+        store
+            .claim_project("Demo-Pkg", "demo-pkg", "alice")
+            .await
+            .unwrap();
         store
             .insert_file(&new_file("demo-pkg", "demo-pkg-1.2.3.tar.gz"))
             .await
@@ -604,8 +668,14 @@ mod tests {
     #[tokio::test]
     async fn projects_sorted_by_name() {
         let store = MemoryStore::new();
-        store.upsert_project("Zebra", "zebra").await.unwrap();
-        store.upsert_project("Apple", "apple").await.unwrap();
+        store
+            .claim_project("Zebra", "zebra", "alice")
+            .await
+            .unwrap();
+        store
+            .claim_project("Apple", "apple", "alice")
+            .await
+            .unwrap();
         store
             .insert_file(&new_file("zebra", "zebra-1.2.3.tar.gz"))
             .await
@@ -623,5 +693,57 @@ mod tests {
     #[tokio::test]
     async fn health_ok() {
         assert!(MemoryStore::new().health_check().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn first_claimant_owns_project() {
+        let store = MemoryStore::new();
+        assert_eq!(
+            store
+                .claim_project("Demo-Pkg", "demo-pkg", "alice")
+                .await
+                .unwrap(),
+            "alice"
+        );
+        // A later claimant learns the existing owner and cannot take over.
+        assert_eq!(
+            store
+                .claim_project("Demo-Pkg", "demo-pkg", "bob")
+                .await
+                .unwrap(),
+            "alice"
+        );
+        store
+            .insert_file(&new_file("demo-pkg", "demo-pkg-1.2.3.tar.gz"))
+            .await
+            .unwrap();
+        let projects = store.list_projects().await.unwrap();
+        assert_eq!(projects[0].owner.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn ownerless_project_is_claimed_by_next_uploader() {
+        let store = MemoryStore::new();
+        // Direct inserts (pre-ownership rows) leave the project ownerless.
+        store
+            .insert_file(&new_file("demo-pkg", "demo-pkg-1.2.3.tar.gz"))
+            .await
+            .unwrap();
+        let projects = store.list_projects().await.unwrap();
+        assert_eq!(projects[0].owner, None);
+        assert_eq!(
+            store
+                .claim_project("Demo-Pkg", "demo-pkg", "bob")
+                .await
+                .unwrap(),
+            "bob"
+        );
+        assert_eq!(
+            store
+                .claim_project("Demo-Pkg", "demo-pkg", "alice")
+                .await
+                .unwrap(),
+            "bob"
+        );
     }
 }

@@ -185,13 +185,25 @@ pub async fn legacy_upload(
         }
     };
 
-    if let Err(err) = state
+    // First uploader owns the project; only the owner may publish to it.
+    // Reads and downloads stay open to every authenticated user.
+    let owner = match state
         .db
-        .upsert_project(&validated.display, &validated.normalized)
+        .claim_project(&validated.display, &validated.normalized, &user.0)
         .await
     {
+        Ok(owner) => owner,
+        Err(err) => {
+            cleanup(&staging).await;
+            return Err(AppError::from(err));
+        }
+    };
+    if owner != user.0 {
         cleanup(&staging).await;
-        return Err(AppError::from(err));
+        return Err(AppError::Forbidden(format!(
+            "project {} is owned by another user",
+            validated.normalized
+        )));
     }
     let new_file = NewFile {
         project_normalized: validated.normalized.clone(),

@@ -500,7 +500,11 @@ async fn unknown_project_returns_404() {
 #[tokio::test]
 async fn row_without_object_returns_404() {
     let (app, state, _tmp) = test_app().await;
-    state.db.upsert_project(PROJECT, NORMALIZED).await.unwrap();
+    state
+        .db
+        .claim_project(PROJECT, NORMALIZED, "ci")
+        .await
+        .unwrap();
     state
         .db
         .insert_file(&NewFile {
@@ -716,6 +720,90 @@ async fn upload_happy_path_with_bearer_auth() {
         .oneshot(get_request(
             &format!("/files/{NORMALIZED}/{FILENAME}"),
             Some(bearer_auth("secret")),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = body_bytes(res.into_body()).await;
+    assert_eq!(bytes, FILE_BYTES);
+}
+
+/// App with two upload users, for project-ownership checks.
+async fn test_app_two_users() -> (Router, AppState, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let settings = test_settings(tmp.path().to_path_buf());
+    let storage = Storage::filesystem(settings.storage_dir.clone());
+    storage.ensure_dirs().await.unwrap();
+    let db = MetadataBackend::Memory(MemoryStore::new());
+    let auth = Auth::from_pairs(vec![
+        ("alice".to_string(), "alice-token".to_string()),
+        ("bob".to_string(), "bob-token".to_string()),
+    ]);
+    let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder()
+        .handle();
+    let state = AppState {
+        db,
+        storage,
+        auth,
+        metrics,
+        settings: Arc::new(settings),
+    };
+    let router = build_router(state.clone());
+    (router, state, tmp)
+}
+
+fn upload_body_for(version: &str, filename: &str, file_bytes: &[u8]) -> Vec<u8> {
+    let digest = sha256_hex(file_bytes);
+    let fields: Vec<(&str, &str)> = vec![
+        (":action", "file_upload"),
+        ("name", PROJECT),
+        ("version", version),
+        ("sha256_digest", digest.as_str()),
+    ];
+    build_multipart(BOUNDARY, &fields, Some(("content", filename, file_bytes)))
+}
+
+#[tokio::test]
+async fn only_project_owner_can_publish() {
+    let (app, state, _tmp) = test_app_two_users().await;
+    let alice = basic_auth("alice", "alice-token");
+    let bob = basic_auth("bob", "bob-token");
+
+    // First upload claims the project for alice.
+    let body = upload_body_for(VERSION, FILENAME, FILE_BYTES);
+    let res = app
+        .oneshot(post_upload_request(Some(alice.clone()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Bob cannot publish a new version to alice's project.
+    let body = upload_body_for("1.2.4", "demo-pkg-1.2.4.tar.gz", b"bob-bytes");
+    let res = build_router(state.clone())
+        .oneshot(post_upload_request(Some(bob.clone()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(
+        staging_is_empty(&state.settings.storage_dir),
+        "staging not empty after 403"
+    );
+
+    // The owner can publish the same new version.
+    let body = upload_body_for("1.2.4", "demo-pkg-1.2.4.tar.gz", b"bob-bytes");
+    let res = build_router(state.clone())
+        .oneshot(post_upload_request(Some(alice), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Reads stay open to every authenticated user, including bob.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/files/{NORMALIZED}/{FILENAME}"),
+            Some(bob),
             None,
         ))
         .await
