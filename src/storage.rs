@@ -61,6 +61,17 @@ pub trait StorageBackend: Clone + Send + Sync + 'static {
     ) -> Result<u64, StorageError>;
     async fn get(&self, project: &str, filename: &str)
         -> Result<Option<(u64, Body)>, StorageError>;
+    /// Stream up to `len` bytes starting at `start`; returns the total
+    /// object size and the number of bytes the body will actually serve
+    /// (clamped at the object end) alongside the body. Used for HTTP
+    /// range downloads.
+    async fn get_range(
+        &self,
+        project: &str,
+        filename: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<(u64, u64, Body)>, StorageError>;
     async fn stat(&self, project: &str, filename: &str) -> Result<Option<u64>, StorageError>;
     async fn delete(&self, project: &str, filename: &str) -> Result<(), StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
@@ -128,6 +139,18 @@ impl Storage {
     ) -> Result<Option<(u64, Body)>, StorageError> {
         match self {
             Self::Filesystem(fs) => fs.get(project, filename).await,
+        }
+    }
+
+    pub async fn get_range(
+        &self,
+        project: &str,
+        filename: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<(u64, u64, Body)>, StorageError> {
+        match self {
+            Self::Filesystem(fs) => fs.get_range(project, filename, start, len).await,
         }
     }
 
@@ -290,6 +313,38 @@ impl StorageBackend for FsBackend {
         Ok(Some((size, Body::from_stream(ReaderStream::new(file)))))
     }
 
+    async fn get_range(
+        &self,
+        project: &str,
+        filename: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<(u64, u64, Body)>, StorageError> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let path = self.object_path(project, filename)?;
+        let mut file = match fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(StorageError::io("open object", e)),
+        };
+        let total = file
+            .metadata()
+            .await
+            .map_err(|e| StorageError::io("stat object", e))?
+            .len();
+        // Clamp against the opened object so callers can trust that the
+        // body serves exactly `served` bytes from this same handle.
+        let served = len.min(total.saturating_sub(start));
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| StorageError::io("seek object", e))?;
+        Ok(Some((
+            total,
+            served,
+            Body::from_stream(ReaderStream::new(file.take(served))),
+        )))
+    }
+
     async fn stat(&self, project: &str, filename: &str) -> Result<Option<u64>, StorageError> {
         let path = self.object_path(project, filename)?;
         match fs::metadata(&path).await {
@@ -355,6 +410,30 @@ mod tests {
             .unwrap();
         assert_eq!(size, 11);
         assert_eq!(collect(body).await, b"wheel-bytes");
+
+        // Ranged reads stream exactly the requested slice plus total size.
+        let (total, served, body) = storage
+            .get_range("demo-pkg", "demo_pkg-1.0-py3-none-any.whl", 2, 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(total, 11);
+        assert_eq!(served, 4);
+        assert_eq!(collect(body).await, b"eel-");
+        // Requests past the end clamp to what the object can serve.
+        let (total, served, body) = storage
+            .get_range("demo-pkg", "demo_pkg-1.0-py3-none-any.whl", 9, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(total, 11);
+        assert_eq!(served, 2);
+        assert_eq!(collect(body).await, b"es");
+        assert!(storage
+            .get_range("demo-pkg", "missing.whl", 0, 4)
+            .await
+            .unwrap()
+            .is_none());
 
         assert!(storage
             .get("demo-pkg", "missing.whl")
