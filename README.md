@@ -112,6 +112,11 @@ DB migrations are embedded in the binary and run automatically at startup.
 Package routes (`/simple/*`, `/files/*`, `/legacy/`) require a token;
 `GET /`, `GET /health`, and `GET /metrics` are open.
 
+`/metrics` exposes request counts, latencies, and upload/download counters
+labelled by route template. Keep it reachable only from trusted networks
+or your Prometheus scraper (firewall/ingress rules); do not publish it on
+a shared or public ingress.
+
 Token file format (path given by `AUTH_TOKEN_FILE`):
 
 ```text
@@ -137,7 +142,7 @@ Transfer ownership with SQL: `UPDATE projects SET owner = '<user>' WHERE name = 
 | GET    | `/`                         | Open | Service info JSON.                                       |
 | GET    | `/health`                   | Open | Readiness: `200 {"status":"ok",...}` or `503` degraded when a dependency is down. |
 | GET    | `/live`                     | Open | Liveness: always `200` while the process serves HTTP; no dependency checks. |
-| GET    | `/metrics`                  | Open | Prometheus text exposition.                              |
+| GET    | `/metrics`                  | Open | Prometheus text exposition (trusted networks only; see Auth). |
 | GET    | `/simple/`                  | Yes  | Project list (PEP 503 HTML; PEP 691 JSON with matching `Accept`). |
 | GET    | `/simple/{project}/`        | Yes  | Project file list (PEP 503 HTML / PEP 691 JSON).         |
 | GET    | `/files/{project}/{filename}` | Yes | Download artifact bytes (`application/octet-stream`).    |
