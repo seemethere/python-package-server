@@ -146,7 +146,10 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Tests use an in-memory store, so no live Postgres is needed for `cargo test`.
+Most tests use an in-memory store, so no live Postgres is needed for
+`cargo test`. Postgres-backed tests in `tests/postgres.rs` run only when
+`TEST_DATABASE_URL` is set (CI sets it against a Postgres service); they
+skip otherwise.
 
 Run the server locally (needs Postgres + a token file):
 
