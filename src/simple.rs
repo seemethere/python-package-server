@@ -224,10 +224,12 @@ mod tests {
             ProjectRecord {
                 name: "demo-pkg".to_string(),
                 display_name: "Demo-Pkg".to_string(),
+                owner: Some("alice".to_string()),
             },
             ProjectRecord {
                 name: "other".to_string(),
                 display_name: "Other & <Co>".to_string(),
+                owner: None,
             },
         ]
     }
@@ -299,6 +301,7 @@ mod tests {
         let projects = vec![ProjectRecord {
             name: "weird pkg/x".to_string(),
             display_name: "Weird <Pkg>".to_string(),
+            owner: None,
         }];
         let index = index_html(&projects);
         assert!(index.contains("<a href=\"/simple/weird%20pkg%2Fx/\">Weird &lt;Pkg&gt;</a>"));

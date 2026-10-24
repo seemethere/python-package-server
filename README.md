@@ -124,6 +124,12 @@ Rotation: edit the file (or replace the mounted secret) — new tokens take
 effect on the next request; no restart needed. Revoking a token is the same:
 remove its line.
 
+Project ownership: the first user to upload a project owns it, and only
+that user may publish further files to it (`403` for everyone else).
+Downloads and index reads stay open to every authenticated user. Projects
+created before ownership was introduced are claimed by their next uploader.
+Transfer ownership with SQL: `UPDATE projects SET owner = '<user>' WHERE name = '<project>';`
+
 ## API summary
 
 | Method | Path                        | Auth | Description                                              |
