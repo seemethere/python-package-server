@@ -60,6 +60,26 @@ pub async fn simple_project(
         }
         _ => Vec::new(),
     };
+    // Quarantine hides young upstream files (hosted files are never
+    // quarantined); when nothing hosted exists and every upstream file is
+    // quarantined, the project reads as missing.
+    let now = crate::upstream::now_unix_secs();
+    let upstream_files: Vec<_> = upstream_files
+        .into_iter()
+        .filter(|file| {
+            let quarantined = crate::upstream::is_quarantined(
+                &state.settings.policy,
+                file,
+                normalized.as_str(),
+                now,
+            );
+            if quarantined {
+                metrics::counter!("upstream_quarantine_filtered_total", "stage" => "index")
+                    .increment(1);
+            }
+            !quarantined
+        })
+        .collect();
     if hosted.is_empty() && upstream_files.is_empty() {
         return Err(AppError::NotFound(format!(
             "project {} not found",

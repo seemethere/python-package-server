@@ -110,6 +110,7 @@ All configuration is via environment variables:
 | `UPSTREAM_URL`    | No       | —              | Upstream simple index base, e.g. `https://pypi.org/simple/`; unset disables pull-through. |
 | `UPSTREAM_INDEX_TTL_SECS` | No | `300`         | TTL for cached upstream project index responses.         |
 | `UPSTREAM_PRIVATE_ONLY_PROJECTS` | No | —       | Comma-separated denylist of projects that never fetch upstream. |
+| `POLICY_FILE`   | No       | —              | Path to the JSON quarantine policy file; unset disables quarantine. |
 
 DB migrations are embedded in the binary and run automatically at startup.
 
@@ -137,6 +138,44 @@ after 10s; file downloads after 600s. File URLs from the upstream index
 are fetched server-side, so `UPSTREAM_URL` must be trusted. v1 has no
 cache eviction: cached bytes persist until overwritten by a hosted
 upload (no API clears the pull-through cache).
+
+### Upstream quarantine
+
+Set `POLICY_FILE` to a JSON policy file to hold new upstream releases
+for a soak period before they become visible or downloadable:
+
+```json
+{
+  "default": { "upstream_quarantine_days": 3 },
+  "packages": {
+    "requests": { "upstream_quarantine_days": 10 },
+    "torch": { "upstream_quarantine_days": 0 }
+  }
+}
+```
+
+An upstream file is hidden from `/simple/{project}/` and blocked on
+`/files/...` until `upload-time + quarantine_days`, where the days come
+from the per-package override or the global `default` (unlisted projects
+use the default; `0` disables quarantine for that scope). Package names
+normalize like everywhere else (`Requests` → `requests`). Quarantined
+files 404 as if missing: an index with no hosted files and only
+quarantined upstream files returns `404`, and downloads 404 even when
+the bytes sit warm in the cache. Hosted files are never quarantined.
+
+Fail-closed rules: an upstream file with unknown age (missing or
+unparseable `upload-time`, or the HTML index fallback, which carries no
+timestamps) is treated as quarantined whenever days apply. Likewise, if
+the upstream index cannot be reached, quarantined-project downloads 404
+— even with warm bytes cached — while `0`-day projects keep serving
+warm bytes (outage tradeoff: quarantine needs fresh age metadata).
+
+The file is read once at startup: a missing, unreadable, or malformed
+file (unknown keys, negative/non-integer days, invalid project names)
+fails startup, and policy changes need a restart (in Kubernetes, update
+the `package-server-policy` ConfigMap and roll the deployment). Filtered
+files count in the `upstream_quarantine_filtered_total` counter, labelled
+by `stage` (`index` or `download`).
 
 ## Auth
 

@@ -1,8 +1,8 @@
 //! Runtime configuration, sourced entirely from the environment (12-factor).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::packaging::normalize_project;
 
@@ -35,6 +35,90 @@ pub struct Settings {
     pub upstream_index_ttl_secs: u64,
     /// Normalized project names that must never be fetched from upstream.
     pub upstream_private_only_projects: HashSet<String>,
+    /// Path to the JSON policy file (`POLICY_FILE`); `None` disables
+    /// file-based policy (upstream quarantine off).
+    pub policy_file: Option<PathBuf>,
+    /// Policy parsed once at startup from [`Settings::policy_file`].
+    pub policy: Policy,
+}
+
+/// Upstream quarantine policy, read once at startup (no hot reload).
+///
+/// An upstream file is hidden and blocked until
+/// `upload_time + quarantine_days`, where the days come from the
+/// per-project override or the global default. `0` disables quarantine.
+/// Hosted files are never quarantined.
+#[derive(Debug, Clone, Default)]
+pub struct Policy {
+    /// Quarantine days for projects without a per-package override.
+    pub quarantine_days_default: u32,
+    /// Per-project override by normalized project name.
+    pub quarantine_days_by_project: HashMap<String, u32>,
+}
+
+impl Policy {
+    /// Quarantine days for one normalized project: per-package override
+    /// when present, otherwise the global default.
+    pub fn quarantine_days_for(&self, normalized: &str) -> u32 {
+        self.quarantine_days_by_project
+            .get(normalized)
+            .copied()
+            .unwrap_or(self.quarantine_days_default)
+    }
+
+    /// Load and validate a policy file, failing fast on any problem.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|err| format!("cannot read policy file {}: {err}", path.display()))?;
+        Self::parse_json(&text)
+            .map_err(|err| format!("invalid policy file {}: {err}", path.display()))
+    }
+
+    fn parse_json(text: &str) -> Result<Self, String> {
+        let raw: PolicyFileJson =
+            serde_json::from_str(text).map_err(|err| format!("malformed JSON: {err}"))?;
+        let mut by_project = HashMap::with_capacity(raw.packages.len());
+        // Sorted so duplicate detection (and its error) is deterministic
+        // rather than HashMap-order dependent.
+        let mut names: Vec<&String> = raw.packages.keys().collect();
+        names.sort();
+        for name in names {
+            let entry = &raw.packages[name];
+            let normalized = normalize_project(name)
+                .map(|n| n.to_string())
+                .map_err(|_| format!("invalid project name '{name}'"))?;
+            if by_project.contains_key(&normalized) {
+                return Err(format!(
+                    "duplicate project '{normalized}' (distinct package keys normalize to the same project)"
+                ));
+            }
+            by_project.insert(normalized, entry.upstream_quarantine_days);
+        }
+        Ok(Self {
+            quarantine_days_default: raw
+                .default
+                .map(|entry| entry.upstream_quarantine_days)
+                .unwrap_or(0),
+            quarantine_days_by_project: by_project,
+        })
+    }
+}
+
+/// Top-level policy file shape. Unknown keys are rejected so typos fail
+/// fast at startup instead of silently disabling quarantine.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyFileJson {
+    #[serde(default)]
+    default: Option<PolicyEntryJson>,
+    #[serde(default)]
+    packages: HashMap<String, PolicyEntryJson>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyEntryJson {
+    upstream_quarantine_days: u32,
 }
 
 impl Settings {
@@ -71,6 +155,11 @@ impl Settings {
         let upstream_url = parse_upstream_url()?;
         let upstream_index_ttl_secs = parse_upstream_index_ttl_secs()?;
         let upstream_private_only_projects = parse_upstream_private_only_projects()?;
+        let policy_file = parse_policy_file();
+        let policy = match &policy_file {
+            Some(path) => Policy::load(path)?,
+            None => Policy::default(),
+        };
         Ok(Self {
             bind_addr: env_or("BIND_ADDR", "0.0.0.0:8000"),
             database_url: required_non_blank("DATABASE_URL")?,
@@ -84,6 +173,8 @@ impl Settings {
             upstream_url,
             upstream_index_ttl_secs,
             upstream_private_only_projects,
+            policy_file,
+            policy,
         })
     }
 }
@@ -176,6 +267,16 @@ fn parse_upstream_private_only_projects() -> Result<HashSet<String>, String> {
     Ok(set)
 }
 
+/// `POLICY_FILE`: blank or unset means no policy file (quarantine off).
+/// A set path is loaded in [`Settings::from_env`]; a missing or invalid
+/// file is a startup error.
+fn parse_policy_file() -> Option<PathBuf> {
+    match env::var("POLICY_FILE") {
+        Ok(value) if !value.trim().is_empty() => Some(PathBuf::from(value.trim())),
+        _ => None,
+    }
+}
+
 /// Parse the upload cap, rejecting non-numeric, zero, and over-i64 values.
 fn parse_max_upload_bytes(raw: &str) -> Result<u64, String> {
     match raw.parse::<u64>() {
@@ -205,6 +306,7 @@ mod tests {
         let saved_upstream_url = env::var("UPSTREAM_URL").ok();
         let saved_upstream_ttl = env::var("UPSTREAM_INDEX_TTL_SECS").ok();
         let saved_private_only = env::var("UPSTREAM_PRIVATE_ONLY_PROJECTS").ok();
+        let saved_policy_file = env::var("POLICY_FILE").ok();
 
         let restore = || {
             restore_var("DATABASE_URL", saved_db.as_deref());
@@ -220,12 +322,14 @@ mod tests {
                 "UPSTREAM_PRIVATE_ONLY_PROJECTS",
                 saved_private_only.as_deref(),
             );
+            restore_var("POLICY_FILE", saved_policy_file.as_deref());
         };
 
         // Valid baseline: upstream disabled by default.
         env::remove_var("UPSTREAM_URL");
         env::remove_var("UPSTREAM_INDEX_TTL_SECS");
         env::remove_var("UPSTREAM_PRIVATE_ONLY_PROJECTS");
+        env::remove_var("POLICY_FILE");
         env::remove_var("STORAGE_BACKEND");
         env::remove_var("S3_BUCKET");
         env::remove_var("S3_REGION");
@@ -237,6 +341,8 @@ mod tests {
         assert_eq!(settings.upstream_url, None);
         assert_eq!(settings.upstream_index_ttl_secs, 300);
         assert!(settings.upstream_private_only_projects.is_empty());
+        assert_eq!(settings.policy_file, None);
+        assert_eq!(settings.policy.quarantine_days_for("anything"), 0);
 
         // Zero cap rejected.
         env::set_var("MAX_UPLOAD_BYTES", "0");
@@ -360,6 +466,39 @@ mod tests {
         );
         env::remove_var("UPSTREAM_PRIVATE_ONLY_PROJECTS");
 
+        // POLICY_FILE: blank/unset means no policy (quarantine off).
+        env::set_var("POLICY_FILE", "   ");
+        let settings = Settings::from_env().unwrap();
+        assert_eq!(settings.policy_file, None);
+        assert_eq!(settings.policy.quarantine_days_for("requests"), 0);
+
+        // A set path loads at startup; overrides beat the default.
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("policy.json");
+        std::fs::write(
+            &policy_path,
+            r#"{"default": {"upstream_quarantine_days": 3},
+                "packages": {"Requests": {"upstream_quarantine_days": 10}}}"#,
+        )
+        .unwrap();
+        env::set_var("POLICY_FILE", &policy_path);
+        let settings = Settings::from_env().unwrap();
+        assert_eq!(settings.policy_file.as_deref(), Some(policy_path.as_path()));
+        assert_eq!(settings.policy.quarantine_days_for("other"), 3);
+        assert_eq!(settings.policy.quarantine_days_for("requests"), 10);
+
+        // Missing file when POLICY_FILE is set fails startup.
+        env::set_var("POLICY_FILE", dir.path().join("does-not-exist.json"));
+        let err = Settings::from_env().unwrap_err();
+        assert!(err.contains("policy file"), "unexpected: {err}");
+
+        // Malformed content fails startup.
+        std::fs::write(&policy_path, "{not json").unwrap();
+        env::set_var("POLICY_FILE", &policy_path);
+        let err = Settings::from_env().unwrap_err();
+        assert!(err.contains("policy file"), "unexpected: {err}");
+        env::remove_var("POLICY_FILE");
+
         restore();
         assert!(Settings::from_env().is_err() || saved_db.is_some());
     }
@@ -377,5 +516,84 @@ mod tests {
         assert!(parse_max_upload_bytes("0").is_err());
         assert!(parse_max_upload_bytes("-5").is_err());
         assert!(parse_max_upload_bytes("").is_err());
+    }
+
+    #[test]
+    fn parses_policy_defaults_and_overrides() {
+        // Empty object: everything 0 (feature off).
+        let policy = Policy::parse_json("{}").unwrap();
+        assert_eq!(policy.quarantine_days_for("requests"), 0);
+
+        // Default only.
+        let policy = Policy::parse_json(r#"{"default": {"upstream_quarantine_days": 3}}"#).unwrap();
+        assert_eq!(policy.quarantine_days_for("requests"), 3);
+
+        // Per-package keys normalize; 0 disables one project.
+        let policy = Policy::parse_json(
+            r#"{"default": {"upstream_quarantine_days": 3},
+                "packages": {
+                  "Requests": {"upstream_quarantine_days": 10},
+                  "Torch": {"upstream_quarantine_days": 0}
+                }}"#,
+        )
+        .unwrap();
+        assert_eq!(policy.quarantine_days_for("other"), 3);
+        assert_eq!(policy.quarantine_days_for("requests"), 10);
+        assert_eq!(policy.quarantine_days_for("torch"), 0);
+    }
+
+    #[test]
+    fn rejects_invalid_policy() {
+        // Malformed JSON and non-object shapes.
+        for bad in ["{not json", "[1, 2]", "\"str\"", "42", ""] {
+            assert!(Policy::parse_json(bad).is_err(), "accepted {bad:?}");
+        }
+        // Unknown top-level keys fail fast (likely typos).
+        for bad in [
+            r#"{"defaults": {"upstream_quarantine_days": 3}}"#,
+            r#"{"default": {"upstream_quarantine_days": 3}, "extra": 1}"#,
+            r#"{"packages": {"a": {"upstream_quarantine_days": 1, "typo": 2}}}"#,
+        ] {
+            assert!(Policy::parse_json(bad).is_err(), "accepted {bad:?}");
+        }
+        // Negative, fractional, or non-numeric days.
+        for bad in [
+            r#"{"default": {"upstream_quarantine_days": -1}}"#,
+            r#"{"default": {"upstream_quarantine_days": 1.5}}"#,
+            r#"{"default": {"upstream_quarantine_days": "3"}}"#,
+            r#"{"packages": {"a": {"upstream_quarantine_days": -7}}}"#,
+            r#"{"default": {}}"#,
+        ] {
+            assert!(Policy::parse_json(bad).is_err(), "accepted {bad:?}");
+        }
+        // Invalid project names.
+        for bad in [
+            r#"{"packages": {"!!!invalid": {"upstream_quarantine_days": 1}}}"#,
+            r#"{"packages": {"": {"upstream_quarantine_days": 1}}}"#,
+        ] {
+            assert!(Policy::parse_json(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_normalized_duplicate_projects() {
+        // Distinct keys that normalize to the same project must fail fast
+        // instead of one silently winning (HashMap order is random).
+        for (bad, normalized) in [
+            (
+                r#"{"packages": {"Foo": {"upstream_quarantine_days": 0}, "foo": {"upstream_quarantine_days": 10}}}"#,
+                "foo",
+            ),
+            (
+                r#"{"packages": {"Demo_Pkg": {"upstream_quarantine_days": 1}, "demo-pkg": {"upstream_quarantine_days": 2}}}"#,
+                "demo-pkg",
+            ),
+        ] {
+            let err = Policy::parse_json(bad).unwrap_err();
+            assert!(
+                err.contains("duplicate") && err.contains(normalized),
+                "error should name the duplicate normalized project '{normalized}': {err}"
+            );
+        }
     }
 }
