@@ -15,6 +15,7 @@ use python_package_server::{
     db::{MemoryStore, MetadataBackend, MetadataStore, NewFile},
     state::AppState,
     storage::Storage,
+    upstream::UpstreamClient,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,6 +32,9 @@ fn test_settings(storage_dir: PathBuf) -> Settings {
         s3_endpoint_url: None,
         auth_token_file: PathBuf::from("/dev/null"),
         max_upload_bytes: 1024 * 1024,
+        upstream_url: None,
+        upstream_index_ttl_secs: 300,
+        upstream_private_only_projects: std::collections::HashSet::new(),
     }
 }
 
@@ -56,9 +60,112 @@ async fn test_app_with_cap(max_upload_bytes: u64) -> (Router, AppState, tempfile
         auth,
         metrics,
         settings: Arc::new(settings),
+        upstream: None,
     };
     let router = build_router(state.clone());
     (router, state, tmp)
+}
+
+async fn test_app_with_upstream(
+    upstream: Option<UpstreamClient>,
+) -> (Router, AppState, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let settings = test_settings(tmp.path().to_path_buf());
+    let storage = Storage::filesystem(settings.storage_dir.clone());
+    storage.ensure_dirs().await.unwrap();
+    let db = MetadataBackend::Memory(MemoryStore::new());
+    let auth = Auth::from_pairs(vec![("ci".to_string(), "secret".to_string())]);
+    let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder()
+        .handle();
+    let state = AppState {
+        db,
+        storage,
+        auth,
+        metrics,
+        settings: Arc::new(settings),
+        upstream,
+    };
+    let router = build_router(state.clone());
+    (router, state, tmp)
+}
+
+async fn seed_hosted(
+    state: &AppState,
+    normalized: &str,
+    display: &str,
+    filename: &str,
+    sha256: &str,
+    requires_python: Option<&str>,
+) {
+    state
+        .db
+        .insert_file(&NewFile {
+            project_normalized: normalized.to_string(),
+            project_display: display.to_string(),
+            filename: filename.to_string(),
+            version: "1.2.3".to_string(),
+            sha256: sha256.to_string(),
+            size_bytes: 42,
+            requires_python: requires_python.map(str::to_string),
+            uploaded_by: "ci".to_string(),
+        })
+        .await
+        .unwrap();
+}
+
+async fn spawn_fake_upstream() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::response::IntoResponse;
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+    let app = Router::new().route(
+        "/{project}/",
+        axum::routing::get(
+            move |axum::extract::Path(project): axum::extract::Path<String>| {
+                let counter = counter_clone.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    match project.as_str() {
+                        "demo-pkg" => axum::Json(serde_json::json!({
+                            "meta": {"api-version": "1.1"},
+                            "name": "demo-pkg",
+                            "files": [
+                                {"filename":"demo-pkg-1.2.3.tar.gz","url":"https://upstream.example/files/demo-pkg-1.2.3.tar.gz","hashes":{"sha256":"0000000000000000000000000000000000000000000000000000000000000000"},"requires-python":">=2.7","yanked":false},
+                                {"filename":"demo-pkg-9.9.9.tar.gz","url":"https://upstream.example/files/demo-pkg-9.9.9.tar.gz","hashes":{"sha256":"9999999999999999999999999999999999999999999999999999999999999999"},"requires-python":">=3.10","yanked":"bad upstream"}
+                            ]
+                        })).into_response(),
+                        "purepkg" => axum::Json(serde_json::json!({
+                            "meta": {"api-version": "1.1"},
+                            "name": "purepkg",
+                            "files": [
+                                {"filename":"purepkg-1.0.tar.gz","url":"https://upstream.example/files/purepkg-1.0.tar.gz","hashes":{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"requires-python":">=3.9","yanked":false},
+                                {"filename":"purepkg-2.0.tar.gz","url":"https://upstream.example/files/purepkg-2.0.tar.gz","hashes":{"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"requires-python":null,"yanked":true}
+                            ]
+                        })).into_response(),
+                        "secret-pkg" => axum::Json(serde_json::json!({
+                            "meta": {"api-version": "1.1"},
+                            "name": "secret-pkg",
+                            "files": [
+                                {"filename":"secret-pkg-9.9.tar.gz","url":"https://upstream.example/files/secret-pkg-9.9.tar.gz","hashes":{"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"requires-python":null,"yanked":false}
+                            ]
+                        })).into_response(),
+                        "htmlpkg" => (
+                            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                            "<!DOCTYPE html><html><body><a href=\"https://files.example/htmlpkg-1.0.tar.gz#sha256=htmlsha123\" data-requires-python=\"&gt;=3.8\">htmlpkg-1.0.tar.gz</a><br/><a href=\"https://files.example/htmlpkg-2.0.tar.gz#sha256=htmlsha456\" data-yanked=\"html yank\">htmlpkg-2.0.tar.gz</a><br/></body></html>".to_string(),
+                        ).into_response(),
+                        "boompkg" => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                        _ => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/"), counter)
 }
 
 fn basic_auth(user: &str, pass: &str) -> String {
@@ -921,6 +1028,7 @@ async fn test_app_two_users() -> (Router, AppState, tempfile::TempDir) {
         auth,
         metrics,
         settings: Arc::new(settings),
+        upstream: None,
     };
     let router = build_router(state.clone());
     (router, state, tmp)
@@ -1306,4 +1414,226 @@ async fn admin_ownerless_claim_and_body_rules() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn upstream_merged_hosted_wins_html_json_parity() {
+    let (base, _counter) = spawn_fake_upstream().await;
+    let client = UpstreamClient::new(
+        base,
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (app, state, _tmp) = test_app_with_upstream(Some(client)).await;
+    let hosted_sha = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    seed_hosted(
+        &state,
+        NORMALIZED,
+        PROJECT,
+        FILENAME,
+        hosted_sha,
+        Some(REQUIRES_PYTHON),
+    )
+    .await;
+    let _ = &app;
+
+    // JSON: hosted first + upstream-only file, hosted wins on duplicate.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/simple/{NORMALIZED}/"),
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let files = json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "json: {text}");
+    assert_eq!(files[0]["filename"], FILENAME);
+    assert_eq!(files[0]["hashes"]["sha256"], hosted_sha);
+    assert_eq!(files[0]["requires-python"], REQUIRES_PYTHON);
+    assert_eq!(files[1]["filename"], "demo-pkg-9.9.9.tar.gz");
+    assert_eq!(files[1]["url"], "/files/demo-pkg/demo-pkg-9.9.9.tar.gz");
+    assert_eq!(
+        files[1]["hashes"]["sha256"],
+        "9999999999999999999999999999999999999999999999999999999999999999"
+    );
+    assert_eq!(files[1]["requires-python"], ">=3.10");
+    assert_eq!(files[1]["yanked"], "bad upstream");
+
+    // HTML: same files, local /files/ URLs with #sha256=, yanked/requires passthrough.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/simple/{NORMALIZED}/"),
+            Some(good_auth()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let html = body_text(res.into_body()).await;
+    assert!(html.contains(FILENAME), "{html}");
+    assert!(html.contains(&format!("#sha256={hosted_sha}")), "{html}");
+    assert!(
+        !html.contains("0000000000000000000000000000000000000000000000000000000000000000"),
+        "upstream duplicate leaked: {html}"
+    );
+    assert!(html.contains("demo-pkg-9.9.9.tar.gz"), "{html}");
+    assert!(
+        html.contains("/files/demo-pkg/demo-pkg-9.9.9.tar.gz#sha256=9999"),
+        "{html}"
+    );
+    assert!(
+        html.contains("data-requires-python=\"&gt;=3.10\""),
+        "{html}"
+    );
+    assert!(html.contains("data-yanked=\"bad upstream\""), "{html}");
+    // Duplicate filename appears once in HTML too.
+    assert_eq!(html.matches(FILENAME).count(), 2, "{html}");
+}
+
+#[tokio::test]
+async fn upstream_pure_proxy_and_html_fallback() {
+    let (base, _counter) = spawn_fake_upstream().await;
+    let client = UpstreamClient::new(
+        base,
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (_app, state, _tmp) = test_app_with_upstream(Some(client)).await;
+
+    // Pure proxy JSON for unhosted project.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/purepkg/",
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["files"].as_array().unwrap().len(), 2);
+    assert_eq!(json["files"][0]["filename"], "purepkg-1.0.tar.gz");
+    assert_eq!(json["files"][0]["requires-python"], ">=3.9");
+    assert_eq!(json["files"][1]["yanked"], true);
+
+    // Pure proxy HTML parity.
+    let res = build_router(state.clone())
+        .oneshot(get_request("/simple/purepkg/", Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let html = body_text(res.into_body()).await;
+    assert!(html.contains("purepkg-1.0.tar.gz"), "{html}");
+    assert!(html.contains("data-yanked=\"\""), "{html}");
+
+    // HTML upstream fallback rendered as JSON and HTML.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/htmlpkg/",
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["files"][0]["filename"], "htmlpkg-1.0.tar.gz");
+    assert_eq!(json["files"][0]["hashes"]["sha256"], "htmlsha123");
+    assert_eq!(json["files"][0]["requires-python"], ">=3.8");
+    assert_eq!(json["files"][1]["yanked"], "html yank");
+    let res = build_router(state.clone())
+        .oneshot(get_request("/simple/htmlpkg/", Some(good_auth()), None))
+        .await
+        .unwrap();
+    let html = body_text(res.into_body()).await;
+    assert!(html.contains("#sha256=htmlsha123"), "{html}");
+    assert!(html.contains("data-yanked=\"html yank\""), "{html}");
+}
+
+#[tokio::test]
+async fn upstream_private_only_never_fetches() {
+    let (base, counter) = spawn_fake_upstream().await;
+    let mut private = std::collections::HashSet::new();
+    private.insert("secret-pkg".to_string());
+    let client = UpstreamClient::new(base, std::time::Duration::from_secs(60), private);
+    let (_app, state, _tmp) = test_app_with_upstream(Some(client)).await;
+    seed_hosted(
+        &state,
+        "secret-pkg",
+        "Secret-Pkg",
+        "secret-pkg-1.0.tar.gz",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        None,
+    )
+    .await;
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/secret-pkg/",
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["files"].as_array().unwrap().len(), 1);
+    assert_eq!(json["files"][0]["filename"], "secret-pkg-1.0.tar.gz");
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "private-only project must not call upstream"
+    );
+
+    // Private-only with no hosted files 404s without calling upstream.
+    let res = build_router(state.clone())
+        .oneshot(get_request("/simple/secret-pkg/", Some(good_auth()), None))
+        .await
+        .unwrap();
+    // Still hosted file exists, so HTML also hosted-only.
+    assert_eq!(res.status(), StatusCode::OK);
+    let html = body_text(res.into_body()).await;
+    assert!(!html.contains("secret-pkg-9.9"), "{html}");
+    assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn upstream_404_and_500_mapping() {
+    let (base, _counter) = spawn_fake_upstream().await;
+    let client = UpstreamClient::new(
+        base,
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (_app, state, _tmp) = test_app_with_upstream(Some(client)).await;
+
+    // Upstream 404 with no hosted => 404.
+    let res = build_router(state.clone())
+        .oneshot(get_request("/simple/missing/", Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    // Upstream 500 => 502.
+    let res = build_router(state.clone())
+        .oneshot(get_request("/simple/boompkg/", Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/boompkg/",
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }

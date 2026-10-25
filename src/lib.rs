@@ -12,6 +12,7 @@ pub mod simple;
 pub mod state;
 pub mod storage;
 pub mod upload;
+pub mod upstream;
 
 use axum::{
     body::Body,
