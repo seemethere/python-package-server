@@ -22,6 +22,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("payload too large")]
     PayloadTooLarge,
+    #[error("bad gateway: {0}")]
+    BadGateway(String),
     #[error("internal error")]
     Internal,
 }
@@ -41,6 +43,7 @@ impl IntoResponse for AppError {
             AppError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, self.to_string()),
+            AppError::BadGateway(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
             AppError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal error".to_string(),

@@ -49,17 +49,29 @@ pub async fn simple_project(
 ) -> Result<Response, AppError> {
     let normalized = normalize_project(&project)
         .map_err(|_| AppError::NotFound(format!("project {project} not found")))?;
-    let files = state.db.list_files(normalized.as_str()).await?;
-    if files.is_empty() {
+    let hosted = state.db.list_files(normalized.as_str()).await?;
+    let upstream_files = match &state.upstream {
+        Some(client) if !client.is_private_only(normalized.as_str()) => {
+            match client.fetch_project(normalized.as_str()).await {
+                Ok(Some(files)) => files,
+                Ok(None) => Vec::new(),
+                Err(err) => return Err(AppError::BadGateway(err.to_string())),
+            }
+        }
+        _ => Vec::new(),
+    };
+    if hosted.is_empty() && upstream_files.is_empty() {
         return Err(AppError::NotFound(format!(
             "project {} not found",
             normalized.as_str()
         )));
     }
-    let display = files
+    let display_owned = hosted
         .first()
-        .map(|file| file.project_display.as_str())
-        .unwrap_or_else(|| normalized.as_str());
+        .map(|f| f.project_display.clone())
+        .unwrap_or_else(|| normalized.as_str().to_string());
+    let display = display_owned.as_str();
+    let files = merge_files(&hosted, upstream_files, normalized.as_str(), display);
     if wants_json(&headers) {
         Ok((
             StatusCode::OK,
@@ -75,6 +87,35 @@ pub async fn simple_project(
         )
             .into_response())
     }
+}
+
+fn merge_files(
+    hosted: &[FileRecord],
+    upstream: Vec<crate::upstream::UpstreamFile>,
+    normalized: &str,
+    display: &str,
+) -> Vec<FileRecord> {
+    let hosted_names: std::collections::HashSet<&str> =
+        hosted.iter().map(|f| f.filename.as_str()).collect();
+    let mut merged = hosted.to_vec();
+    for file in upstream {
+        if hosted_names.contains(file.filename.as_str()) {
+            continue;
+        }
+        merged.push(FileRecord {
+            project: normalized.to_string(),
+            project_display: display.to_string(),
+            filename: file.filename,
+            version: String::new(),
+            sha256: file.sha256,
+            size_bytes: 0,
+            requires_python: file.requires_python,
+            uploaded_by: String::new(),
+            yanked: file.yanked,
+            yank_reason: file.yank_reason,
+        });
+    }
+    merged
 }
 
 /// True when the client prefers the PEP 691 JSON representation.

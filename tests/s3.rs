@@ -22,6 +22,9 @@ fn test_settings(endpoint: String, staging_dir: PathBuf) -> Settings {
         s3_endpoint_url: Some(endpoint),
         auth_token_file: PathBuf::from("/dev/null"),
         max_upload_bytes: 1024 * 1024,
+        upstream_url: None,
+        upstream_index_ttl_secs: 300,
+        upstream_private_only_projects: std::collections::HashSet::new(),
     }
 }
 

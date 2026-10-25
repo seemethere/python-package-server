@@ -1,7 +1,10 @@
 //! Runtime configuration, sourced entirely from the environment (12-factor).
 
+use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
+
+use crate::packaging::normalize_project;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -25,6 +28,13 @@ pub struct Settings {
     pub auth_token_file: PathBuf,
     /// Maximum accepted upload body in bytes.
     pub max_upload_bytes: u64,
+    /// Optional upstream index base URL (e.g. `https://pypi.org/simple`).
+    /// `None` disables the upstream pull-through cache.
+    pub upstream_url: Option<String>,
+    /// TTL in seconds for cached upstream project index responses.
+    pub upstream_index_ttl_secs: u64,
+    /// Normalized project names that must never be fetched from upstream.
+    pub upstream_private_only_projects: HashSet<String>,
 }
 
 impl Settings {
@@ -58,6 +68,9 @@ impl Settings {
             Err(_) => None,
         };
         let max_upload_bytes = parse_max_upload_bytes(&env_or("MAX_UPLOAD_BYTES", "1073741824"))?;
+        let upstream_url = parse_upstream_url()?;
+        let upstream_index_ttl_secs = parse_upstream_index_ttl_secs()?;
+        let upstream_private_only_projects = parse_upstream_private_only_projects()?;
         Ok(Self {
             bind_addr: env_or("BIND_ADDR", "0.0.0.0:8000"),
             database_url: required_non_blank("DATABASE_URL")?,
@@ -68,6 +81,9 @@ impl Settings {
             s3_endpoint_url,
             auth_token_file: PathBuf::from(required_non_blank("AUTH_TOKEN_FILE")?),
             max_upload_bytes,
+            upstream_url,
+            upstream_index_ttl_secs,
+            upstream_private_only_projects,
         })
     }
 }
@@ -88,8 +104,15 @@ fn required_non_blank(key: &str) -> Result<String, String> {
 /// Require an `http`/`https` endpoint with a host, so malformed values
 /// fail at startup instead of as per-request endpoint-resolution errors.
 fn validate_endpoint_url(value: &str) -> Result<(), String> {
-    let invalid =
-        || format!("invalid S3_ENDPOINT_URL '{value}' (want http:// or https:// with a host)");
+    validate_http_url(value, "S3_ENDPOINT_URL")
+}
+
+fn validate_upstream_url(value: &str) -> Result<(), String> {
+    validate_http_url(value, "UPSTREAM_URL")
+}
+
+fn validate_http_url(value: &str, env_name: &str) -> Result<(), String> {
+    let invalid = || format!("invalid {env_name} '{value}' (want http:// or https:// with a host)");
     let rest = value
         .strip_prefix("http://")
         .or_else(|| value.strip_prefix("https://"))
@@ -99,6 +122,58 @@ fn validate_endpoint_url(value: &str) -> Result<(), String> {
         return Err(invalid());
     }
     Ok(())
+}
+
+fn parse_upstream_url() -> Result<Option<String>, String> {
+    match env::var("UPSTREAM_URL") {
+        Ok(value) if !value.trim().is_empty() => {
+            let value = value.trim().to_string();
+            validate_upstream_url(&value)?;
+            Ok(Some(value))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn parse_upstream_index_ttl_secs() -> Result<u64, String> {
+    match env::var("UPSTREAM_INDEX_TTL_SECS") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            match trimmed.parse::<u64>() {
+                Ok(0) => Err(
+                    "invalid UPSTREAM_INDEX_TTL_SECS (must be a positive integer, got 0)"
+                        .to_string(),
+                ),
+                Ok(n) => Ok(n),
+                Err(_) => {
+                    Err("invalid UPSTREAM_INDEX_TTL_SECS (want a positive integer)".to_string())
+                }
+            }
+        }
+        Err(_) => Ok(300),
+    }
+}
+
+fn parse_upstream_private_only_projects() -> Result<HashSet<String>, String> {
+    let raw = match env::var("UPSTREAM_PRIVATE_ONLY_PROJECTS") {
+        Ok(value) => value,
+        Err(_) => return Ok(HashSet::new()),
+    };
+    if raw.trim().is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut set = HashSet::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let normalized = normalize_project(entry).map_err(|_| {
+            format!("invalid UPSTREAM_PRIVATE_ONLY_PROJECTS entry '{entry}' (invalid project name)")
+        })?;
+        set.insert(normalized.to_string());
+    }
+    Ok(set)
 }
 
 /// Parse the upload cap, rejecting non-numeric, zero, and over-i64 values.
@@ -127,6 +202,9 @@ mod tests {
         let saved_bucket = env::var("S3_BUCKET").ok();
         let saved_region = env::var("S3_REGION").ok();
         let saved_endpoint = env::var("S3_ENDPOINT_URL").ok();
+        let saved_upstream_url = env::var("UPSTREAM_URL").ok();
+        let saved_upstream_ttl = env::var("UPSTREAM_INDEX_TTL_SECS").ok();
+        let saved_private_only = env::var("UPSTREAM_PRIVATE_ONLY_PROJECTS").ok();
 
         let restore = || {
             restore_var("DATABASE_URL", saved_db.as_deref());
@@ -136,13 +214,29 @@ mod tests {
             restore_var("S3_BUCKET", saved_bucket.as_deref());
             restore_var("S3_REGION", saved_region.as_deref());
             restore_var("S3_ENDPOINT_URL", saved_endpoint.as_deref());
+            restore_var("UPSTREAM_URL", saved_upstream_url.as_deref());
+            restore_var("UPSTREAM_INDEX_TTL_SECS", saved_upstream_ttl.as_deref());
+            restore_var(
+                "UPSTREAM_PRIVATE_ONLY_PROJECTS",
+                saved_private_only.as_deref(),
+            );
         };
 
-        // Valid baseline.
+        // Valid baseline: upstream disabled by default.
+        env::remove_var("UPSTREAM_URL");
+        env::remove_var("UPSTREAM_INDEX_TTL_SECS");
+        env::remove_var("UPSTREAM_PRIVATE_ONLY_PROJECTS");
+        env::remove_var("STORAGE_BACKEND");
+        env::remove_var("S3_BUCKET");
+        env::remove_var("S3_REGION");
+        env::remove_var("S3_ENDPOINT_URL");
         env::set_var("DATABASE_URL", "postgres://localhost/packages");
         env::set_var("AUTH_TOKEN_FILE", "/tmp/tokens");
         env::set_var("MAX_UPLOAD_BYTES", "1024");
-        assert!(Settings::from_env().is_ok());
+        let settings = Settings::from_env().unwrap();
+        assert_eq!(settings.upstream_url, None);
+        assert_eq!(settings.upstream_index_ttl_secs, 300);
+        assert!(settings.upstream_private_only_projects.is_empty());
 
         // Zero cap rejected.
         env::set_var("MAX_UPLOAD_BYTES", "0");
@@ -214,6 +308,57 @@ mod tests {
             .unwrap_err()
             .contains("STORAGE_BACKEND"));
         env::remove_var("STORAGE_BACKEND");
+
+        // Upstream URL: blank means disabled, valid URL is kept, bad fails fast.
+        env::set_var("UPSTREAM_URL", "   ");
+        let settings = Settings::from_env().unwrap();
+        assert_eq!(settings.upstream_url, None);
+        env::set_var("UPSTREAM_URL", "https://pypi.org/simple");
+        let settings = Settings::from_env().unwrap();
+        assert_eq!(
+            settings.upstream_url.as_deref(),
+            Some("https://pypi.org/simple")
+        );
+        for bad in [
+            "pypi.org/simple",
+            "ftp://pypi.org/simple",
+            "http://",
+            "http://a b",
+        ] {
+            env::set_var("UPSTREAM_URL", bad);
+            let err = Settings::from_env().unwrap_err();
+            assert!(err.contains("UPSTREAM_URL"), "{bad}: {err}");
+        }
+        env::remove_var("UPSTREAM_URL");
+
+        // Upstream TTL: default 300, valid override, zero/invalid rejected.
+        env::set_var("UPSTREAM_INDEX_TTL_SECS", "60");
+        assert_eq!(Settings::from_env().unwrap().upstream_index_ttl_secs, 60);
+        for bad in ["0", "-1", "abc", ""] {
+            env::set_var("UPSTREAM_INDEX_TTL_SECS", bad);
+            let err = Settings::from_env().unwrap_err();
+            assert!(err.contains("UPSTREAM_INDEX_TTL_SECS"), "{bad}: {err}");
+        }
+        env::remove_var("UPSTREAM_INDEX_TTL_SECS");
+
+        // Private-only list: normalized, deduped, invalid fails startup.
+        env::set_var(
+            "UPSTREAM_PRIVATE_ONLY_PROJECTS",
+            "Demo_Pkg, demo-pkg , Other.Name",
+        );
+        let settings = Settings::from_env().unwrap();
+        assert_eq!(settings.upstream_private_only_projects.len(), 2);
+        assert!(settings.upstream_private_only_projects.contains("demo-pkg"));
+        assert!(settings
+            .upstream_private_only_projects
+            .contains("other-name"));
+        env::set_var("UPSTREAM_PRIVATE_ONLY_PROJECTS", "!!!invalid");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("UPSTREAM_PRIVATE_ONLY_PROJECTS"),
+            "unexpected: {err}"
+        );
+        env::remove_var("UPSTREAM_PRIVATE_ONLY_PROJECTS");
 
         restore();
         assert!(Settings::from_env().is_err() || saved_db.is_some());

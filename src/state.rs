@@ -8,4 +8,5 @@ pub struct AppState {
     pub auth: crate::auth::Auth,
     pub metrics: metrics_exporter_prometheus::PrometheusHandle,
     pub settings: std::sync::Arc<crate::config::Settings>,
+    pub upstream: Option<crate::upstream::UpstreamClient>,
 }

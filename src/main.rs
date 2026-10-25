@@ -89,12 +89,14 @@ async fn main() {
         }
     };
 
+    let upstream = python_package_server::upstream::UpstreamClient::from_settings(&settings);
     let state = AppState {
         db,
         storage,
         auth,
         metrics,
         settings: Arc::clone(&settings),
+        upstream,
     };
     let app = build_router(state);
 
