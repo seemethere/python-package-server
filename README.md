@@ -107,6 +107,9 @@ All configuration is via environment variables:
 | `AUTH_TOKEN_FILE` | Yes      | —              | Path to the token file (see Auth).                       |
 | `MAX_UPLOAD_BYTES`| No       | `1073741824`   | Max upload body in bytes (default 1 GiB).                |
 | `RUST_LOG`        | No       | `info`         | Log filter, e.g. `info`, `debug`, `warn`.                |
+| `UPSTREAM_URL`    | No       | —              | Upstream simple index base, e.g. `https://pypi.org/simple/`; unset disables pull-through. |
+| `UPSTREAM_INDEX_TTL_SECS` | No | `300`         | TTL for cached upstream project index responses.         |
+| `UPSTREAM_PRIVATE_ONLY_PROJECTS` | No | —       | Comma-separated denylist of projects that never fetch upstream. |
 
 DB migrations are embedded in the binary and run automatically at startup.
 
@@ -119,6 +122,21 @@ fast instead of erroring per request. Uploads still stage on local disk
 S3-compatible endpoint, `docker compose --profile s3 up s3mock` provides
 an in-memory one with a pre-created `packages` bucket (development only;
 see [docker-compose.yml](./docker-compose.yml)).
+
+### Upstream pull-through (virtual repo)
+
+Set `UPSTREAM_URL` (e.g. `https://pypi.org/simple/`) to merge a hosted
+index with upstream GAR-style: `/simple/{project}/` returns hosted files
+plus upstream files, with hosted winning on exact filename. Projects
+listed in `UPSTREAM_PRIVATE_ONLY_PROJECTS` (comma-separated, normalized
+like `Demo_Pkg` → `demo-pkg`) never fetch upstream. Upstream downloads
+are sha256-verified against the index hash before caching, and cached
+bytes keep serving while upstream is down (the merged index itself
+returns `502` once its short cache expires). Index fetches time out
+after 10s; file downloads after 600s. File URLs from the upstream index
+are fetched server-side, so `UPSTREAM_URL` must be trusted. v1 has no
+cache eviction: cached bytes persist until overwritten by a hosted
+upload (no API clears the pull-through cache).
 
 ## Auth
 
@@ -263,7 +281,7 @@ Notes:
 
 ## Roadmap
 
-- Virtual/merged repos (upstream proxying)
+- [x] Virtual/merged repos (upstream proxying)
 - OIDC SSO alongside token auth
 - nginx read-through cache in front of `/files`
 
