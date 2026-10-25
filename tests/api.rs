@@ -18,6 +18,7 @@ use python_package_server::{
     upstream::UpstreamClient,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -1636,4 +1637,753 @@ async fn upstream_404_and_500_mapping() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+}
+
+/// A file served by the fake file-upstream: the index advertises
+/// `index_sha256` for `filename` under `project`, while `GET /files/{filename}`
+/// serves `bytes`. Divergence between the two models a corrupt upstream.
+struct FakeUpstreamFile {
+    project: &'static str,
+    filename: &'static str,
+    index_sha256: String,
+    bytes: Vec<u8>,
+}
+
+struct FakeFileUpstream {
+    base: String,
+    index_hits: Arc<AtomicUsize>,
+    file_hits: Arc<AtomicUsize>,
+}
+
+impl FakeFileUpstream {
+    fn index_hits(&self) -> usize {
+        self.index_hits.load(Ordering::SeqCst)
+    }
+
+    fn file_hits(&self) -> usize {
+        self.file_hits.load(Ordering::SeqCst)
+    }
+}
+
+/// Fake upstream serving both a JSON index and downloadable file bytes, with
+/// separate request counters so tests can prove (non-)fetching. Index file
+/// URLs point back at this server's own `/files/` route.
+async fn spawn_fake_file_upstream(files: Vec<FakeUpstreamFile>) -> FakeFileUpstream {
+    use axum::response::IntoResponse;
+    // Bind first so the index URLs can point at our own address.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}/");
+    let index_hits = Arc::new(AtomicUsize::new(0));
+    let file_hits = Arc::new(AtomicUsize::new(0));
+    let files = Arc::new(files);
+    let index_files = files.clone();
+    let index_base = base.clone();
+    let index_hits_clone = index_hits.clone();
+    let file_hits_clone = file_hits.clone();
+    let app = Router::new()
+        .route(
+            "/{project}/",
+            axum::routing::get(
+                move |axum::extract::Path(project): axum::extract::Path<String>| {
+                    let index_hits = index_hits_clone.clone();
+                    let files = index_files.clone();
+                    let base = index_base.clone();
+                    async move {
+                        index_hits.fetch_add(1, Ordering::SeqCst);
+                        let entries: Vec<serde_json::Value> = files
+                            .iter()
+                            .filter(|f| f.project == project)
+                            .map(|f| {
+                                serde_json::json!({
+                                    "filename": f.filename,
+                                    "url": format!("{base}files/{}", f.filename),
+                                    "hashes": {"sha256": f.index_sha256},
+                                    "requires-python": null,
+                                    "yanked": false,
+                                })
+                            })
+                            .collect();
+                        if entries.is_empty() {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        axum::Json(serde_json::json!({
+                            "meta": {"api-version": "1.1"},
+                            "name": project,
+                            "files": entries,
+                        }))
+                        .into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/files/{filename}",
+            axum::routing::get(
+                move |axum::extract::Path(filename): axum::extract::Path<String>| {
+                    let file_hits = file_hits_clone.clone();
+                    let files = files.clone();
+                    async move {
+                        file_hits.fetch_add(1, Ordering::SeqCst);
+                        match files.iter().find(|f| f.filename == filename) {
+                            Some(f) => (
+                                [(header::CONTENT_TYPE, "application/octet-stream")],
+                                f.bytes.clone(),
+                            )
+                                .into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                },
+            ),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    FakeFileUpstream {
+        base,
+        index_hits,
+        file_hits,
+    }
+}
+
+async fn test_app_with_file_upstream(
+    files: Vec<FakeUpstreamFile>,
+) -> (Router, AppState, tempfile::TempDir, FakeFileUpstream) {
+    let fake = spawn_fake_file_upstream(files).await;
+    let client = UpstreamClient::new(
+        fake.base.clone(),
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (router, state, tmp) = test_app_with_upstream(Some(client)).await;
+    (router, state, tmp, fake)
+}
+
+const CACHE_PROJECT: &str = "cachepkg";
+const CACHE_FILE: &str = "cachepkg-1.0.tar.gz";
+const CACHE_BYTES: &[u8] =
+    b"upstream cached wheel bytes v1.0 - predictable content for range tests!";
+
+fn cache_fixture() -> FakeUpstreamFile {
+    FakeUpstreamFile {
+        project: CACHE_PROJECT,
+        filename: CACHE_FILE,
+        index_sha256: sha256_hex(CACHE_BYTES),
+        bytes: CACHE_BYTES.to_vec(),
+    }
+}
+
+fn cache_url() -> String {
+    format!("/files/{CACHE_PROJECT}/{CACHE_FILE}")
+}
+
+#[tokio::test]
+async fn upstream_cold_miss_caches_and_serves() {
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![cache_fixture()]).await;
+    let expected_etag = format!("\"{}\"", sha256_hex(CACHE_BYTES));
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(header::ETAG).unwrap(),
+        expected_etag.as_str()
+    );
+    let bytes = body_bytes(res.into_body()).await;
+    assert_eq!(bytes, CACHE_BYTES);
+
+    // Exactly one index lookup + one file fetch, then bytes are cached.
+    assert_eq!(fake.index_hits(), 1);
+    assert_eq!(fake.file_hits(), 1);
+    assert_eq!(
+        state.storage.stat(CACHE_PROJECT, CACHE_FILE).await.unwrap(),
+        Some(CACHE_BYTES.len() as u64)
+    );
+    assert!(
+        staging_is_empty(&state.settings.storage_dir),
+        "staging not empty after cache fill"
+    );
+}
+
+#[tokio::test]
+async fn upstream_warm_hit_skips_upstream() {
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![cache_fixture()]).await;
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let first_etag = res
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(body_bytes(res.into_body()).await, CACHE_BYTES);
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers().get(header::ETAG).unwrap(), &first_etag);
+    assert_eq!(body_bytes(res.into_body()).await, CACHE_BYTES);
+
+    // The second request served from cache: no further upstream calls.
+    assert_eq!(fake.index_hits(), 1);
+    assert_eq!(fake.file_hits(), 1);
+}
+
+#[tokio::test]
+async fn upstream_cold_miss_range_serves_slice() {
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![cache_fixture()]).await;
+    let total = CACHE_BYTES.len();
+
+    let ranged = Request::builder()
+        .method("GET")
+        .uri(cache_url())
+        .header(header::AUTHORIZATION, good_auth())
+        .header(header::RANGE, "bytes=0-4")
+        .body(Body::empty())
+        .unwrap();
+    let res = build_router(state.clone()).oneshot(ranged).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        res.headers().get(header::CONTENT_RANGE).unwrap(),
+        &format!("bytes 0-4/{total}")
+    );
+    assert_eq!(body_bytes(res.into_body()).await, CACHE_BYTES[0..5]);
+
+    // The ranged cold miss still filled the cache: a full GET fetches nothing.
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, CACHE_BYTES);
+    assert_eq!(fake.file_hits(), 1);
+}
+
+#[tokio::test]
+async fn upstream_corrupt_bytes_rejected_with_502() {
+    let genuine = b"the genuine upstream bytes";
+    let tampered = b"tampered bytes that fail verification!!!";
+    assert_ne!(sha256_hex(genuine), sha256_hex(tampered));
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![FakeUpstreamFile {
+        project: "badpkg",
+        filename: "badpkg-1.0.tar.gz",
+        index_sha256: sha256_hex(genuine),
+        bytes: tampered.to_vec(),
+    }])
+    .await;
+    let url = "/files/badpkg/badpkg-1.0.tar.gz";
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(url, Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+
+    // Nothing cached: no object, no sidecar, empty staging.
+    assert_eq!(
+        state
+            .storage
+            .stat("badpkg", "badpkg-1.0.tar.gz")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        state
+            .storage
+            .stat(".upstream-cache", "badpkg--badpkg-1.0.tar.gz.sha256")
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        staging_is_empty(&state.settings.storage_dir),
+        "staging not empty after corrupt rejection"
+    );
+
+    // Failures are not cached either: the retry fetches upstream again.
+    let res = build_router(state.clone())
+        .oneshot(get_request(url, Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(fake.index_hits(), 1, "index is TTL-cached");
+    assert_eq!(fake.file_hits(), 2, "file fetch retried, not cached");
+}
+
+#[tokio::test]
+async fn upstream_concurrent_cold_miss_fetches_once() {
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![cache_fixture()]).await;
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let router = build_router(state.clone());
+        let url = cache_url();
+        handles.push(tokio::spawn(async move {
+            router
+                .oneshot(get_request(&url, Some(good_auth()), None))
+                .await
+                .unwrap()
+        }));
+    }
+    for handle in handles {
+        let res = handle.await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_bytes(res.into_body()).await, CACHE_BYTES);
+    }
+
+    // Single-flight: one leader resolved + fetched while waiters served cache.
+    assert_eq!(fake.index_hits(), 1);
+    assert_eq!(fake.file_hits(), 1);
+}
+
+#[tokio::test]
+async fn upstream_down_warm_cache_still_serves() {
+    let (_app, mut state, _tmp, fake) = test_app_with_file_upstream(vec![cache_fixture()]).await;
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, CACHE_BYTES);
+
+    // Point a FRESH client (empty index cache) at a dead port: any upstream
+    // call at all would fail, so a 200 proves the warm path is self-sufficient.
+    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = dead_listener.local_addr().unwrap().port();
+    drop(dead_listener);
+    state.upstream = Some(UpstreamClient::new(
+        format!("http://127.0.0.1:{dead_port}/"),
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    ));
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, CACHE_BYTES);
+    assert_eq!(fake.index_hits(), 1, "no further index calls");
+    assert_eq!(fake.file_hits(), 1, "no further file fetches");
+}
+
+#[tokio::test]
+async fn upstream_private_only_download_never_fetches() {
+    let fake = spawn_fake_file_upstream(vec![cache_fixture()]).await;
+    let mut private = std::collections::HashSet::new();
+    private.insert(CACHE_PROJECT.to_string());
+    let client = UpstreamClient::new(
+        fake.base.clone(),
+        std::time::Duration::from_secs(60),
+        private,
+    );
+    let (_app, state, _tmp) = test_app_with_upstream(Some(client)).await;
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fake.index_hits(), 0);
+    assert_eq!(fake.file_hits(), 0);
+    assert_eq!(
+        state.storage.stat(CACHE_PROJECT, CACHE_FILE).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn upstream_unknown_filename_is_404() {
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![cache_fixture()]).await;
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/files/{CACHE_PROJECT}/definitely-missing-9.9.tar.gz"),
+            Some(good_auth()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    // The index was consulted (and cached) but no file fetch was attempted.
+    assert_eq!(fake.index_hits(), 1);
+    assert_eq!(fake.file_hits(), 0);
+}
+
+#[tokio::test]
+async fn download_miss_without_upstream_is_404() {
+    let (app, _state, _tmp) = test_app().await;
+    let res = app
+        .oneshot(get_request(
+            "/files/nothing/nothing-1.0.tar.gz",
+            Some(good_auth()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn hosted_upload_shadows_cached_upstream_file() {
+    const PROJECT: &str = "shadowpkg";
+    const FILE: &str = "shadowpkg-1.0.tar.gz";
+    const UPSTREAM_BYTES: &[u8] = b"upstream bytes for the shadowed file";
+    const HOSTED_BYTES: &[u8] = b"hosted bytes that win after shadowing upload";
+    let (_app, state, _tmp, _fake) = test_app_with_file_upstream(vec![FakeUpstreamFile {
+        project: PROJECT,
+        filename: FILE,
+        index_sha256: sha256_hex(UPSTREAM_BYTES),
+        bytes: UPSTREAM_BYTES.to_vec(),
+    }])
+    .await;
+    let url = format!("/files/{PROJECT}/{FILE}");
+
+    // Cold miss caches + serves the upstream bytes.
+    let res = build_router(state.clone())
+        .oneshot(get_request(&url, Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, UPSTREAM_BYTES);
+
+    // A later hosted upload of the same key wins immediately.
+    let digest = sha256_hex(HOSTED_BYTES);
+    let fields: Vec<(&str, &str)> = vec![
+        (":action", "file_upload"),
+        ("name", "ShadowPkg"),
+        ("version", "1.0"),
+        ("sha256_digest", digest.as_str()),
+    ];
+    let body = build_multipart(BOUNDARY, &fields, Some(("content", FILE, HOSTED_BYTES)));
+    let res = build_router(state.clone())
+        .oneshot(post_upload_request(Some(good_auth()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(&url, Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(header::ETAG).unwrap(),
+        &format!("\"{digest}\"")
+    );
+    assert_eq!(body_bytes(res.into_body()).await, HOSTED_BYTES);
+}
+
+#[tokio::test]
+async fn upstream_concurrent_failing_fetch_never_overlaps() {
+    use axum::response::IntoResponse;
+    // Slow failing file endpoint with peak-concurrency tracking: a broken
+    // single-flight lets waiters mint fresh slots and overlap here.
+    let index_hits = Arc::new(AtomicUsize::new(0));
+    let file_hits = Arc::new(AtomicUsize::new(0));
+    let current = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}/");
+    let index_base = base.clone();
+    let ih = index_hits.clone();
+    let fh = file_hits.clone();
+    let cur = current.clone();
+    let max = max_seen.clone();
+    let app = Router::new()
+        .route(
+            "/{project}/",
+            axum::routing::get(
+                move |axum::extract::Path(project): axum::extract::Path<String>| {
+                    let base = index_base.clone();
+                    let ih = ih.clone();
+                    async move {
+                        ih.fetch_add(1, Ordering::SeqCst);
+                        if project != "failpkg" {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        axum::Json(serde_json::json!({
+                            "meta": {"api-version": "1.1"},
+                            "name": "failpkg",
+                            "files": [{
+                                "filename": "failpkg-1.0.tar.gz",
+                                "url": format!("{base}files/failpkg-1.0.tar.gz"),
+                                "hashes": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+                                "requires-python": null,
+                                "yanked": false,
+                            }]
+                        }))
+                        .into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/files/{filename}",
+            axum::routing::get(
+                move |axum::extract::Path(filename): axum::extract::Path<String>| {
+                    let fh = fh.clone();
+                    let cur = cur.clone();
+                    let max = max.clone();
+                    async move {
+                        if filename != "failpkg-1.0.tar.gz" {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        fh.fetch_add(1, Ordering::SeqCst);
+                        let n = cur.fetch_add(1, Ordering::SeqCst) + 1;
+                        max.fetch_max(n, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        cur.fetch_sub(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                },
+            ),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = UpstreamClient::new(
+        base,
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (_app, state, _tmp) = test_app_with_upstream(Some(client)).await;
+    let url = "/files/failpkg/failpkg-1.0.tar.gz";
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let router = build_router(state.clone());
+        let url = url.to_string();
+        handles.push(tokio::spawn(async move {
+            router
+                .oneshot(get_request(&url, Some(good_auth()), None))
+                .await
+                .unwrap()
+        }));
+    }
+    for handle in handles {
+        let res = handle.await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // Failures are retried per waiter but strictly serially: peak overlap 1.
+    assert_eq!(index_hits.load(Ordering::SeqCst), 1, "index TTL-cached");
+    assert_eq!(
+        file_hits.load(Ordering::SeqCst),
+        4,
+        "each waiter retries serially"
+    );
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "failing fetches must never overlap"
+    );
+    assert!(
+        staging_is_empty(&state.settings.storage_dir),
+        "staging not empty after failing fetches"
+    );
+}
+
+#[tokio::test]
+async fn cold_fill_aborts_when_hosted_upload_wins_race() {
+    use axum::response::IntoResponse;
+    const PROJECT: &str = "racepkg";
+    const FILE: &str = "racepkg-1.0.tar.gz";
+    const UPSTREAM_BYTES: &[u8] = b"upstream bytes that must lose the race";
+    const HOSTED_BYTES: &[u8] = b"hosted bytes that win the race";
+    // Slow success endpoint: the 500ms window lets the test upload land
+    // deterministically mid-flight (after file_hits==1, before streaming ends).
+    let file_hits = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}/");
+    let index_base = base.clone();
+    let upstream_sha = sha256_hex(UPSTREAM_BYTES);
+    let fh = file_hits.clone();
+    let app = Router::new()
+        .route(
+            "/{project}/",
+            axum::routing::get(
+                move |axum::extract::Path(project): axum::extract::Path<String>| {
+                    let base = index_base.clone();
+                    let sha = upstream_sha.clone();
+                    async move {
+                        if project != PROJECT {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        axum::Json(serde_json::json!({
+                            "meta": {"api-version": "1.1"},
+                            "name": PROJECT,
+                            "files": [{
+                                "filename": FILE,
+                                "url": format!("{base}files/{FILE}"),
+                                "hashes": {"sha256": sha},
+                                "requires-python": null,
+                                "yanked": false,
+                            }]
+                        }))
+                        .into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/files/{filename}",
+            axum::routing::get(
+                move |axum::extract::Path(filename): axum::extract::Path<String>| {
+                    let fh = fh.clone();
+                    async move {
+                        if filename != FILE {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        fh.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        (
+                            [(header::CONTENT_TYPE, "application/octet-stream")],
+                            UPSTREAM_BYTES.to_vec(),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = UpstreamClient::new(
+        base,
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (_app, state, _tmp) = test_app_with_upstream(Some(client)).await;
+    let url = format!("/files/{PROJECT}/{FILE}");
+
+    // Start the cold download in the background.
+    let bg_state = state.clone();
+    let bg_url = url.clone();
+    let bg = tokio::spawn(async move {
+        build_router(bg_state)
+            .oneshot(get_request(&bg_url, Some(good_auth()), None))
+            .await
+            .unwrap()
+    });
+    // Wait until the upstream fetch is inside its slow window.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while file_hits.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("upstream fetch never started");
+
+    // Hosted upload of the same key lands mid-flight and must win.
+    let digest = sha256_hex(HOSTED_BYTES);
+    let fields: Vec<(&str, &str)> = vec![
+        (":action", "file_upload"),
+        ("name", "RacePkg"),
+        ("version", "1.0"),
+        ("sha256_digest", digest.as_str()),
+    ];
+    let body = build_multipart(BOUNDARY, &fields, Some(("content", FILE, HOSTED_BYTES)));
+    let res = build_router(state.clone())
+        .oneshot(post_upload_request(Some(good_auth()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // The in-flight download serves hosted bytes, not the stale upstream fill.
+    let res = bg.await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(header::ETAG).unwrap(),
+        &format!("\"{digest}\"")
+    );
+    assert_eq!(body_bytes(res.into_body()).await, HOSTED_BYTES);
+
+    // And the cache fill never overwrote the hosted object.
+    let res = build_router(state.clone())
+        .oneshot(get_request(&url, Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, HOSTED_BYTES);
+    assert_eq!(
+        state
+            .storage
+            .stat(".upstream-cache", &format!("{PROJECT}--{FILE}.sha256"))
+            .await
+            .unwrap(),
+        None,
+        "aborted fill must not write a sidecar"
+    );
+    assert!(
+        staging_is_empty(&state.settings.storage_dir),
+        "staging not empty after aborted fill"
+    );
+}
+
+#[tokio::test]
+async fn warm_cache_normalizes_uppercase_sidecar() {
+    use tokio::io::AsyncWriteExt;
+    const PROJECT: &str = "casepkg";
+    const FILE: &str = "casepkg-1.0.tar.gz";
+    const BYTES: &[u8] = b"bytes for uppercase sidecar test";
+    // Empty upstream: any index/file call proves the warm path leaked.
+    let fake = spawn_fake_file_upstream(vec![]).await;
+    let client = UpstreamClient::new(
+        fake.base.clone(),
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (_app, state, _tmp) = test_app_with_upstream(Some(client)).await;
+
+    // Seed cached bytes plus an UPPERCASE hex sidecar directly.
+    let (staging, mut dest) = state.storage.create_staging_file().await.unwrap();
+    dest.write_all(BYTES).await.unwrap();
+    dest.flush().await.unwrap();
+    drop(dest);
+    state
+        .storage
+        .put_file(PROJECT, FILE, &staging)
+        .await
+        .unwrap();
+    let upper = sha256_hex(BYTES).to_ascii_uppercase();
+    let (staging2, mut dest2) = state.storage.create_staging_file().await.unwrap();
+    dest2.write_all(upper.as_bytes()).await.unwrap();
+    dest2.flush().await.unwrap();
+    drop(dest2);
+    let sidecar = format!("{PROJECT}--{FILE}.sha256");
+    state
+        .storage
+        .put_file(".upstream-cache", &sidecar, &staging2)
+        .await
+        .unwrap();
+
+    let url = format!("/files/{PROJECT}/{FILE}");
+    let res = build_router(state.clone())
+        .oneshot(get_request(&url, Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let expected_etag = format!("\"{}\"", sha256_hex(BYTES));
+    assert_eq!(
+        res.headers().get(header::ETAG).unwrap(),
+        expected_etag.as_str(),
+        "warm ETag must be lowercase hex"
+    );
+    assert_eq!(body_bytes(res.into_body()).await, BYTES);
+    assert_eq!(fake.index_hits(), 0, "warm hit must skip the index");
+    assert_eq!(fake.file_hits(), 0, "warm hit must skip file fetch");
 }
