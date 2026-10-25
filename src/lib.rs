@@ -7,6 +7,7 @@ pub mod files;
 pub mod health;
 pub mod packaging;
 pub mod reconcile;
+pub mod s3;
 pub mod simple;
 pub mod state;
 pub mod storage;
