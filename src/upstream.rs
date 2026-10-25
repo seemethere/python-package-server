@@ -6,11 +6,19 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::config::Settings;
 
 const JSON_ACCEPT: &str = "application/vnd.pypi.simple.v1+json";
+
+/// Total timeout for upstream index fetches (small JSON/HTML bodies).
+const INDEX_TIMEOUT_SECS: u64 = 10;
+
+/// Total timeout for upstream file downloads. Streaming bodies are still
+/// capped per chunk by `max_upload_bytes`, so this only bounds stalled
+/// transfers — large files must not hit the 10s index budget.
+const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamFile {
@@ -42,15 +50,56 @@ struct CacheEntry {
 pub struct UpstreamClient {
     base_url: String,
     http: reqwest::Client,
+    download_http: reqwest::Client,
     ttl: Duration,
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
     private_only: HashSet<String>,
+    inflight: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+/// Single-flight permit for one upstream file fetch.
+///
+/// While held, no other holder for the same `(project, filename)` key runs a
+/// fetch; holders that arrive later re-check the byte cache after acquiring,
+/// so exactly one fetch fills the cache on success. On failure the next
+/// waiter retries serially (never concurrently); dropping never poisons the
+/// key because removal is identity-checked (see [`Drop`]).
+pub struct FetchPermit {
+    _guard: OwnedMutexGuard<()>,
+    slot: Arc<Mutex<()>>,
+    inflight: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    key: String,
+}
+
+impl Drop for FetchPermit {
+    fn drop(&mut self) {
+        // Remove only our own idle slot. An unconditional remove lets a
+        // stale drop delete a newer live entry, and lets arrivals after a
+        // failed fetch each mint a fresh slot and fetch concurrently.
+        // A contended map leaves the entry behind; reuse is harmless
+        // because waiters always re-check the cache after acquiring.
+        if let Ok(mut inflight) = self.inflight.try_lock() {
+            let is_ours = inflight
+                .get(&self.key)
+                .is_some_and(|existing| Arc::ptr_eq(existing, &self.slot));
+            if !is_ours {
+                return;
+            }
+            // Live refs with no waiters: map(1) + our `slot` field(1) + our
+            // guard's Arc(1) = 3. Any waiter holds >=1 extra clone (its
+            // local `slot` plus the queued lock future's Arc while pending),
+            // so `> 3` means someone is queued on this slot: keep it.
+            if Arc::strong_count(&self.slot) <= 3 {
+                inflight.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl UpstreamClient {
     pub fn new(base_url: impl Into<String>, ttl: Duration, private_only: HashSet<String>) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(INDEX_TIMEOUT_SECS))
             .build()
             .unwrap_or_default();
         Self::with_http(base_url, ttl, private_only, http)
@@ -68,12 +117,21 @@ impl UpstreamClient {
         } else {
             format!("{base_url}/")
         };
+        // Downloads always get the generous budget, even when the caller
+        // injects a custom index client: streaming bodies must not share
+        // the 10s index timeout.
+        let download_http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_default();
         Self {
             base_url,
             http,
+            download_http,
             ttl,
             cache: Arc::new(RwLock::new(HashMap::new())),
             private_only,
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -161,6 +219,46 @@ impl UpstreamClient {
     ) -> Result<Option<UpstreamFile>, UpstreamError> {
         let files = self.fetch_project(normalized).await?;
         Ok(files.and_then(|files| files.into_iter().find(|f| f.filename == filename)))
+    }
+
+    /// Acquire the single-flight permit for `(project, filename)`.
+    ///
+    /// Callers must re-check the byte cache after acquiring: the previous
+    /// holder may have filled it while this call was queued.
+    pub async fn acquire_fetch(&self, project: &str, filename: &str) -> FetchPermit {
+        let key = format!("{project}/{filename}");
+        let slot = {
+            let mut inflight = self.inflight.lock().await;
+            inflight
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let guard = Arc::clone(&slot).lock_owned().await;
+        FetchPermit {
+            _guard: guard,
+            slot,
+            inflight: Arc::clone(&self.inflight),
+            key,
+        }
+    }
+
+    /// GET an upstream file URL for streaming; non-success statuses are errors.
+    ///
+    /// Uses the download client (`DOWNLOAD_TIMEOUT_SECS`), not the 10s index
+    /// client, so large files can stream to completion.
+    pub async fn download(&self, url: &str) -> Result<reqwest::Response, UpstreamError> {
+        let response = self
+            .download_http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| UpstreamError::Request(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(UpstreamError::Status(status.as_u16()));
+        }
+        Ok(response)
     }
 }
 

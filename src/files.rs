@@ -5,8 +5,17 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use http_body_util::BodyExt;
+use sha2::Digest;
+use tokio::io::AsyncWriteExt;
 
-use crate::{db::MetadataStore, error::AppError, packaging::normalize_project, state::AppState};
+use crate::{
+    db::MetadataStore,
+    error::{internal, AppError},
+    packaging::normalize_project,
+    state::AppState,
+    upstream::UpstreamClient,
+};
 
 /// A parsed single byte range against a known object size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +129,10 @@ fn header_list_str(headers: &HeaderMap, name: header::HeaderName) -> Option<Stri
 ///
 /// Honors a single `Range` (`206`/`416`), `If-None-Match` (`304`), and
 /// `If-Range`. Yanked files download normally; yanking only affects
-/// installer selection through the index.
+/// installer selection through the index. On a metadata miss with an upstream
+/// configured, falls back to fetching the file from upstream, verifying its
+/// sha256, caching the bytes, and serving them; warm cache hits never touch
+/// upstream.
 pub async fn download_file(
     State(state): State<AppState>,
     Path((project, filename)): Path<(String, String)>,
@@ -131,26 +143,47 @@ pub async fn download_file(
     let is_head = method == axum::http::Method::HEAD;
     let normalized = normalize_project(&project)
         .map_err(|_| AppError::NotFound(format!("project {project} not found")))?;
-    let record = state
-        .db
-        .get_file(normalized.as_str(), &filename)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("file {filename} not found")))?;
-    let etag = format!("\"{}\"", record.sha256);
-    let size = match state.storage.stat(normalized.as_str(), &filename).await? {
-        Some(size) => size,
-        None => {
-            tracing::warn!(
-                project = normalized.as_str(),
-                filename = filename.as_str(),
-                "file row present but storage object missing"
-            );
-            return Err(AppError::NotFound(format!("file {filename} not found")));
+    let project = normalized.as_str();
+    // A DB row always wins: hosted files serve exactly as before, shadowing
+    // any upstream-cached bytes stored under the same key.
+    let (sha256, size) = match state.db.get_file(project, &filename).await? {
+        Some(record) => {
+            let size = match state.storage.stat(project, &filename).await? {
+                Some(size) => size,
+                None => {
+                    tracing::warn!(
+                        project,
+                        filename = filename.as_str(),
+                        "file row present but storage object missing"
+                    );
+                    return Err(AppError::NotFound(format!("file {filename} not found")));
+                }
+            };
+            (record.sha256, size)
         }
+        None => fetch_upstream(&state, project, &filename).await?,
     };
+    serve_stored(&state, project, &filename, &sha256, size, &headers, is_head).await
+}
+
+/// Serve known-stored bytes with range/conditional/HEAD support.
+///
+/// Shared by the hosted and upstream-cache paths: `sha256` feeds the ETag and
+/// `size` seeds the range parser, while response headers always come from the
+/// opened object itself.
+async fn serve_stored(
+    state: &AppState,
+    project: &str,
+    filename: &str,
+    sha256: &str,
+    size: u64,
+    headers: &HeaderMap,
+    is_head: bool,
+) -> Result<Response, AppError> {
+    let etag = format!("\"{sha256}\"");
 
     // If-None-Match takes precedence over Range.
-    if let Some(value) = header_list_str(&headers, header::IF_NONE_MATCH) {
+    if let Some(value) = header_list_str(headers, header::IF_NONE_MATCH) {
         if etag_matches(&value, &etag) {
             return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
         }
@@ -159,12 +192,12 @@ pub async fn download_file(
     // If-Range guards the range against a changed object; a mismatch
     // (including the date form, which never equals our ETag) means the
     // client gets the full current object instead.
-    let if_range_fresh = match header_str(&headers, header::IF_RANGE) {
+    let if_range_fresh = match header_str(headers, header::IF_RANGE) {
         None => true,
         Some(value) => value.trim() == etag,
     };
     let parsed = if if_range_fresh {
-        header_str(&headers, header::RANGE).map(|value| parse_range(value, size))
+        header_str(headers, header::RANGE).map(|value| parse_range(value, size))
     } else {
         None
     };
@@ -199,7 +232,7 @@ pub async fn download_file(
             // a Content-Range that disagrees with the body.
             let (total, served, body) = match state
                 .storage
-                .get_range(normalized.as_str(), &filename, start, len)
+                .get_range(project, filename, start, len)
                 .await?
             {
                 Some(found) => found,
@@ -251,7 +284,7 @@ pub async fn download_file(
                 )
                     .into_response());
             }
-            let (size, body) = match state.storage.get(normalized.as_str(), &filename).await? {
+            let (size, body) = match state.storage.get(project, filename).await? {
                 Some(found) => found,
                 None => {
                     return Err(AppError::NotFound(format!("file {filename} not found")));
@@ -271,6 +304,276 @@ pub async fn download_file(
                 .into_response())
         }
     }
+}
+
+/// Storage project holding upstream-cache sha256 sidecars.
+///
+/// `.upstream-cache` can never be a normalized project name (names must start
+/// with a letter or digit), so hosted uploads, admin deletes, and metadata
+/// rows can never collide with these keys.
+const SIDECAR_PROJECT: &str = ".upstream-cache";
+
+/// Sidecar key for cached `(project, filename)` bytes; the content is the
+/// lowercase hex sha256, letting warm hits build ETags without the index.
+fn sidecar_filename(project: &str, filename: &str) -> String {
+    format!("{project}--{filename}.sha256")
+}
+
+/// Best-effort removal of a staging file.
+async fn cleanup(path: &std::path::Path) {
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+/// Resolve a DB-missed file through the upstream pull-through cache.
+///
+/// The guards (no upstream, private-only) 404 without any upstream call.
+/// Otherwise serves warm bytes, or cold-fetches, verifies, and caches them.
+/// Records exactly one `upstream_file_fetches_total` outcome per call: `hit`
+/// (warm serve, no fetch), `miss` (fetched + cached), or `error` (any failure
+/// to serve through this path, including unknown filenames and oversize or
+/// unverifiable upstream files).
+async fn fetch_upstream(
+    state: &AppState,
+    project: &str,
+    filename: &str,
+) -> Result<(String, u64), AppError> {
+    let Some(client) = state.upstream.as_ref() else {
+        return Err(AppError::NotFound(format!("file {filename} not found")));
+    };
+    if client.is_private_only(project) {
+        return Err(AppError::NotFound(format!("file {filename} not found")));
+    }
+    // Warm bytes serve without touching upstream, so an expired index entry
+    // or a downed upstream never breaks already-cached downloads.
+    if let Some(hit) = warm_cache_checked(state, project, filename).await? {
+        metrics::counter!("upstream_file_fetches_total", "result" => "hit").increment(1);
+        return Ok(hit);
+    }
+    let permit = client.acquire_fetch(project, filename).await;
+    // A waiter re-checks: the previous holder may have filled the cache.
+    if let Some(hit) = warm_cache_checked(state, project, filename).await? {
+        metrics::counter!("upstream_file_fetches_total", "result" => "hit").increment(1);
+        drop(permit);
+        return Ok(hit);
+    }
+    let outcome = cold_fetch(state, client, project, filename).await;
+    drop(permit);
+    match outcome {
+        Ok(hit) => {
+            metrics::counter!("upstream_file_fetches_total", "result" => "miss").increment(1);
+            Ok(hit)
+        }
+        Err(err) => {
+            metrics::counter!("upstream_file_fetches_total", "result" => "error").increment(1);
+            Err(err)
+        }
+    }
+}
+
+/// Warm-hit probe: stored bytes plus a valid sidecar hash, with zero upstream
+/// I/O. `None` means cold (or an unusable entry the cold path re-fetches).
+async fn warm_cache(
+    state: &AppState,
+    project: &str,
+    filename: &str,
+) -> Result<Option<(String, u64)>, AppError> {
+    let Some(size) = state.storage.stat(project, filename).await? else {
+        return Ok(None);
+    };
+    let sidecar = sidecar_filename(project, filename);
+    let Some((_, body)) = state.storage.get(SIDECAR_PROJECT, &sidecar).await? else {
+        return Ok(None);
+    };
+    let bytes = body
+        .collect()
+        .await
+        .map_err(|err| internal(format!("read cache sidecar: {err}")))?
+        .to_bytes();
+    let Ok(sha256) = std::str::from_utf8(&bytes) else {
+        return Ok(None);
+    };
+    let sha256 = sha256.trim();
+    if sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(Some((sha256.to_ascii_lowercase(), size)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// [`warm_cache`] that counts a storage failure as an `error` outcome, keeping
+/// the one-outcome-per-fallback-request invariant.
+async fn warm_cache_checked(
+    state: &AppState,
+    project: &str,
+    filename: &str,
+) -> Result<Option<(String, u64)>, AppError> {
+    warm_cache(state, project, filename).await.map_err(|err| {
+        metrics::counter!("upstream_file_fetches_total", "result" => "error").increment(1);
+        err
+    })
+}
+
+/// Cold-miss fill: resolve via the upstream index, stream-download to staging
+/// with hashing + size cap, verify, then cache bytes + sidecar hash. Returns
+/// the verified lowercase hex sha256 and cached size.
+async fn cold_fetch(
+    state: &AppState,
+    client: &UpstreamClient,
+    project: &str,
+    filename: &str,
+) -> Result<(String, u64), AppError> {
+    // The index is consulted only to learn the file URL + expected hash.
+    let file = match client.file_for(project, filename).await {
+        Ok(Some(file)) => file,
+        Ok(None) => return Err(AppError::NotFound(format!("file {filename} not found"))),
+        Err(err) => return Err(AppError::BadGateway(err.to_string())),
+    };
+    let expected = file.sha256.trim().to_string();
+    if expected.is_empty() {
+        return Err(AppError::BadGateway(format!(
+            "upstream file {filename} has no sha256"
+        )));
+    }
+    let mut response = client
+        .download(&file.url)
+        .await
+        .map_err(|err| AppError::BadGateway(err.to_string()))?;
+    let (staging, mut dest) = state.storage.create_staging_file().await?;
+    let mut hasher = sha2::Sha256::new();
+    let mut size: u64 = 0;
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(err) => {
+                drop(dest);
+                cleanup(&staging).await;
+                return Err(AppError::BadGateway(format!(
+                    "upstream download failed: {err}"
+                )));
+            }
+        };
+        size += chunk.len() as u64;
+        if size > state.settings.max_upload_bytes {
+            drop(dest);
+            cleanup(&staging).await;
+            return Err(AppError::BadGateway(format!(
+                "upstream file {filename} exceeds size limit"
+            )));
+        }
+        if let Err(err) = dest.write_all(&chunk).await {
+            drop(dest);
+            cleanup(&staging).await;
+            return Err(internal(format!("write staging file: {err}")));
+        }
+        hasher.update(&chunk);
+    }
+    if let Err(err) = dest.flush().await {
+        drop(dest);
+        cleanup(&staging).await;
+        return Err(internal(format!("write staging file: {err}")));
+    }
+    drop(dest);
+    let computed = hex::encode(hasher.finalize());
+    if !computed.eq_ignore_ascii_case(&expected) {
+        cleanup(&staging).await;
+        return Err(AppError::BadGateway(format!(
+            "upstream file {filename} failed sha256 verification"
+        )));
+    }
+    // A hosted upload may have published this key while we streamed. Hosted
+    // rows always win: abort the cache write instead of overwriting them.
+    match hosted_during_fetch(state, project, filename).await {
+        Ok(Some(hosted)) => {
+            cleanup(&staging).await;
+            return Ok(hosted);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            cleanup(&staging).await;
+            return Err(err);
+        }
+    }
+    // Sidecar first, so cached bytes always carry their hash; a failed sidecar
+    // write caches nothing at all.
+    if let Err(err) = put_sidecar(state, project, filename, &computed).await {
+        cleanup(&staging).await;
+        return Err(err);
+    }
+    // Re-check immediately before the byte publish: an upload that landed
+    // during the sidecar write must not have its bytes overwritten. A
+    // leftover sidecar here is harmless (hosted rows shadow the cache).
+    match hosted_during_fetch(state, project, filename).await {
+        Ok(Some(hosted)) => {
+            cleanup(&staging).await;
+            return Ok(hosted);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            cleanup(&staging).await;
+            return Err(err);
+        }
+    }
+    let size = match state.storage.put_file(project, filename, &staging).await {
+        Ok(size) => size,
+        Err(err) => {
+            cleanup(&staging).await;
+            return Err(AppError::from(err));
+        }
+    };
+    Ok((computed, size))
+}
+
+/// Re-resolve `(project, filename)` as hosted after a cold download.
+///
+/// `Ok(Some)` means a hosted row appeared during the fetch: the caller must
+/// abort its cache write and serve these hosted bytes instead. `Ok(None)`
+/// means still unhosted (safe to cache). A row with no visible bytes yet is
+/// an upload mid-publish: report 404 like the hosted path rather than
+/// racing its imminent `put_file`.
+async fn hosted_during_fetch(
+    state: &AppState,
+    project: &str,
+    filename: &str,
+) -> Result<Option<(String, u64)>, AppError> {
+    let Some(record) = state.db.get_file(project, filename).await? else {
+        return Ok(None);
+    };
+    match state.storage.stat(project, filename).await? {
+        Some(size) => Ok(Some((record.sha256, size))),
+        None => Err(AppError::NotFound(format!("file {filename} not found"))),
+    }
+}
+
+/// Cache the verified hash sidecar for `(project, filename)`.
+async fn put_sidecar(
+    state: &AppState,
+    project: &str,
+    filename: &str,
+    sha256: &str,
+) -> Result<(), AppError> {
+    let (staging, mut dest) = state.storage.create_staging_file().await?;
+    if let Err(err) = dest.write_all(sha256.as_bytes()).await {
+        drop(dest);
+        cleanup(&staging).await;
+        return Err(internal(format!("write sidecar staging file: {err}")));
+    }
+    if let Err(err) = dest.flush().await {
+        drop(dest);
+        cleanup(&staging).await;
+        return Err(internal(format!("write sidecar staging file: {err}")));
+    }
+    drop(dest);
+    let sidecar = sidecar_filename(project, filename);
+    if let Err(err) = state
+        .storage
+        .put_file(SIDECAR_PROJECT, &sidecar, &staging)
+        .await
+    {
+        cleanup(&staging).await;
+        return Err(AppError::from(err));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
