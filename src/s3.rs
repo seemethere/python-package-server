@@ -126,14 +126,32 @@ fn is_missing_get(
 impl StorageBackend for S3Backend {
     async fn put_file(
         &self,
-        _project: &str,
-        _filename: &str,
-        _src: &Path,
+        project: &str,
+        filename: &str,
+        src: &Path,
     ) -> Result<u64, StorageError> {
-        // Landed with the write-path change; reads work without it.
-        Err(StorageError::Io(
-            "s3 put_file is not implemented yet".to_string(),
-        ))
+        let key = Self::key(project, filename)?;
+        let size = tokio::fs::metadata(src)
+            .await
+            .map_err(|err| StorageError::io("stat staged upload", err))?
+            .len();
+        // Streamed from disk; the staged file is never loaded into memory.
+        let body = aws_sdk_s3::primitives::ByteStream::from_path(src)
+            .await
+            .map_err(|err| StorageError::io("read staged upload", err))?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| StorageError::io("put object", err))?;
+        // Mirror the filesystem backend: a successful publish consumes
+        // the staging file. Removal is best-effort; the startup sweep
+        // collects anything left behind.
+        let _ = tokio::fs::remove_file(src).await;
+        Ok(size)
     }
 
     async fn get(
