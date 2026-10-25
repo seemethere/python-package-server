@@ -25,9 +25,12 @@ services:
       RUST_LOG: info
       # Upstream pull-through (disabled by default; uncomment to enable):
       # UPSTREAM_URL: https://pypi.org/simple/
+      # Upstream quarantine policy (read once at startup; uncomment to enable):
+      # POLICY_FILE: /config/policy.json  # also mount a /config volume with policy.json (see below)
     volumes:
       - ./data:/data
       - ./dev.tokens:/secrets/tokens:ro
+      # - ./policy.json:/config/policy.json:ro  # required when POLICY_FILE is set
     depends_on:
       db:
         condition: service_healthy

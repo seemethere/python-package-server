@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use python_package_server::{
     auth::Auth,
     build_router,
-    config::Settings,
+    config::{Policy, Settings},
     db::{MemoryStore, MetadataBackend, MetadataStore, NewFile},
     state::AppState,
     storage::Storage,
@@ -36,6 +36,8 @@ fn test_settings(storage_dir: PathBuf) -> Settings {
         upstream_url: None,
         upstream_index_ttl_secs: 300,
         upstream_private_only_projects: std::collections::HashSet::new(),
+        policy_file: None,
+        policy: python_package_server::config::Policy::default(),
     }
 }
 
@@ -70,8 +72,16 @@ async fn test_app_with_cap(max_upload_bytes: u64) -> (Router, AppState, tempfile
 async fn test_app_with_upstream(
     upstream: Option<UpstreamClient>,
 ) -> (Router, AppState, tempfile::TempDir) {
+    test_app_with_upstream_and_policy(upstream, Policy::default()).await
+}
+
+async fn test_app_with_upstream_and_policy(
+    upstream: Option<UpstreamClient>,
+    policy: Policy,
+) -> (Router, AppState, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
-    let settings = test_settings(tmp.path().to_path_buf());
+    let mut settings = test_settings(tmp.path().to_path_buf());
+    settings.policy = policy;
     let storage = Storage::filesystem(settings.storage_dir.clone());
     storage.ensure_dirs().await.unwrap();
     let db = MetadataBackend::Memory(MemoryStore::new());
@@ -1642,11 +1652,14 @@ async fn upstream_404_and_500_mapping() {
 /// A file served by the fake file-upstream: the index advertises
 /// `index_sha256` for `filename` under `project`, while `GET /files/{filename}`
 /// serves `bytes`. Divergence between the two models a corrupt upstream.
+/// `upload_time` is the PEP 691 `upload-time` string (`None` omits it,
+/// modelling an upstream without timestamps).
 struct FakeUpstreamFile {
     project: &'static str,
     filename: &'static str,
     index_sha256: String,
     bytes: Vec<u8>,
+    upload_time: Option<String>,
 }
 
 struct FakeFileUpstream {
@@ -1695,13 +1708,18 @@ async fn spawn_fake_file_upstream(files: Vec<FakeUpstreamFile>) -> FakeFileUpstr
                             .iter()
                             .filter(|f| f.project == project)
                             .map(|f| {
-                                serde_json::json!({
+                                let mut entry = serde_json::json!({
                                     "filename": f.filename,
                                     "url": format!("{base}files/{}", f.filename),
                                     "hashes": {"sha256": f.index_sha256},
                                     "requires-python": null,
                                     "yanked": false,
-                                })
+                                });
+                                if let Some(upload_time) = &f.upload_time {
+                                    entry["upload-time"] =
+                                        serde_json::Value::String(upload_time.clone());
+                                }
+                                entry
                             })
                             .collect();
                         if entries.is_empty() {
@@ -1750,13 +1768,20 @@ async fn spawn_fake_file_upstream(files: Vec<FakeUpstreamFile>) -> FakeFileUpstr
 async fn test_app_with_file_upstream(
     files: Vec<FakeUpstreamFile>,
 ) -> (Router, AppState, tempfile::TempDir, FakeFileUpstream) {
+    test_app_with_file_upstream_and_policy(files, Policy::default()).await
+}
+
+async fn test_app_with_file_upstream_and_policy(
+    files: Vec<FakeUpstreamFile>,
+    policy: Policy,
+) -> (Router, AppState, tempfile::TempDir, FakeFileUpstream) {
     let fake = spawn_fake_file_upstream(files).await;
     let client = UpstreamClient::new(
         fake.base.clone(),
         std::time::Duration::from_secs(60),
         std::collections::HashSet::new(),
     );
-    let (router, state, tmp) = test_app_with_upstream(Some(client)).await;
+    let (router, state, tmp) = test_app_with_upstream_and_policy(Some(client), policy).await;
     (router, state, tmp, fake)
 }
 
@@ -1771,6 +1796,7 @@ fn cache_fixture() -> FakeUpstreamFile {
         filename: CACHE_FILE,
         index_sha256: sha256_hex(CACHE_BYTES),
         bytes: CACHE_BYTES.to_vec(),
+        upload_time: Some("2020-01-01T00:00:00Z".to_string()),
     }
 }
 
@@ -1879,6 +1905,7 @@ async fn upstream_corrupt_bytes_rejected_with_502() {
         filename: "badpkg-1.0.tar.gz",
         index_sha256: sha256_hex(genuine),
         bytes: tampered.to_vec(),
+        upload_time: None,
     }])
     .await;
     let url = "/files/badpkg/badpkg-1.0.tar.gz";
@@ -2046,6 +2073,7 @@ async fn hosted_upload_shadows_cached_upstream_file() {
         filename: FILE,
         index_sha256: sha256_hex(UPSTREAM_BYTES),
         bytes: UPSTREAM_BYTES.to_vec(),
+        upload_time: None,
     }])
     .await;
     let url = format!("/files/{PROJECT}/{FILE}");
@@ -2545,6 +2573,7 @@ async fn upstream_percent_encoded_filename_round_trips() {
         filename: FILE,
         index_sha256: sha256_hex(BYTES),
         bytes: BYTES.to_vec(),
+        upload_time: None,
     }])
     .await;
 
@@ -2655,4 +2684,451 @@ async fn upstream_private_only_denylist_is_normalized() {
     // (the fake would otherwise serve two files for demo-pkg).
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
     assert_eq!(counter.load(Ordering::SeqCst), 0);
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Format unix seconds as a PEP 691 `upload-time` (RFC 3339 UTC).
+fn rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+fn test_policy(default_days: u32, overrides: &[(&str, u32)]) -> Policy {
+    Policy {
+        quarantine_days_default: default_days,
+        quarantine_days_by_project: overrides
+            .iter()
+            .map(|(project, days)| ((*project).to_string(), *days))
+            .collect(),
+    }
+}
+
+/// Fake upstream index with now-relative `upload-time` values, computed per
+/// request: `youngpkg` (1h old), `oldpkg` (30d old), `mixedpkg` (one of
+/// each), `requests` (5d old), `torch` (1h old), and `notimepkg` (no
+/// `upload-time` key at all).
+async fn spawn_quarantine_upstream() -> String {
+    use axum::response::IntoResponse;
+    const YOUNG_SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const OLD_SHA: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    fn entry(filename: &str, sha: &str, age_secs: Option<u64>) -> serde_json::Value {
+        let mut entry = serde_json::json!({
+            "filename": filename,
+            "url": format!("https://upstream.example/files/{filename}"),
+            "hashes": {"sha256": sha},
+            "requires-python": null,
+            "yanked": false,
+        });
+        if let Some(age) = age_secs {
+            entry["upload-time"] =
+                serde_json::Value::String(rfc3339(unix_now().saturating_sub(age)));
+        }
+        entry
+    }
+    let app = Router::new().route(
+        "/{project}/",
+        axum::routing::get(
+            |axum::extract::Path(project): axum::extract::Path<String>| async move {
+                const HOUR: u64 = 3600;
+                const DAY: u64 = 86_400;
+                let files: Vec<serde_json::Value> = match project.as_str() {
+                    "youngpkg" => vec![entry("youngpkg-2.0.tar.gz", YOUNG_SHA, Some(HOUR))],
+                    "oldpkg" => vec![entry("oldpkg-1.0.tar.gz", OLD_SHA, Some(30 * DAY))],
+                    "mixedpkg" => vec![
+                        entry("mixedpkg-new.tar.gz", YOUNG_SHA, Some(HOUR)),
+                        entry("mixedpkg-old.tar.gz", OLD_SHA, Some(30 * DAY)),
+                    ],
+                    "requests" => vec![entry("requests-9.9.tar.gz", YOUNG_SHA, Some(5 * DAY))],
+                    "torch" => vec![entry("torch-9.9.tar.gz", YOUNG_SHA, Some(HOUR))],
+                    "notimepkg" => vec![entry("notimepkg-1.0.tar.gz", OLD_SHA, None)],
+                    _ => return StatusCode::NOT_FOUND.into_response(),
+                };
+                axum::Json(serde_json::json!({
+                    "meta": {"api-version": "1.1"},
+                    "name": project,
+                    "files": files,
+                }))
+                .into_response()
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}/")
+}
+
+async fn quarantine_index_app(policy: Policy) -> (AppState, tempfile::TempDir) {
+    let base = spawn_quarantine_upstream().await;
+    let client = UpstreamClient::new(
+        base,
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (_router, state, tmp) = test_app_with_upstream_and_policy(Some(client), policy).await;
+    (state, tmp)
+}
+
+/// Seed pull-through cache bytes + sidecar directly (lowercase hex hash).
+async fn seed_warm_cache(state: &AppState, project: &str, filename: &str, bytes: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    let (staging, mut dest) = state.storage.create_staging_file().await.unwrap();
+    dest.write_all(bytes).await.unwrap();
+    dest.flush().await.unwrap();
+    drop(dest);
+    state
+        .storage
+        .put_file(project, filename, &staging)
+        .await
+        .unwrap();
+    let (staging2, mut dest2) = state.storage.create_staging_file().await.unwrap();
+    dest2.write_all(sha256_hex(bytes).as_bytes()).await.unwrap();
+    dest2.flush().await.unwrap();
+    drop(dest2);
+    state
+        .storage
+        .put_file(
+            ".upstream-cache",
+            &format!("{project}--{filename}.sha256"),
+            &staging2,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn quarantine_young_hidden_old_visible_index() {
+    let (state, _tmp) = quarantine_index_app(test_policy(3, &[])).await;
+
+    // Young-only project reads as missing in both formats.
+    for accept in [None, Some(JSON_ACCEPT)] {
+        let res = build_router(state.clone())
+            .oneshot(get_request("/simple/youngpkg/", Some(good_auth()), accept))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "accept={accept:?}");
+    }
+
+    // Old file visible in both formats.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/oldpkg/",
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["files"].as_array().unwrap().len(), 1, "{text}");
+    assert_eq!(json["files"][0]["filename"], "oldpkg-1.0.tar.gz");
+    let res = build_router(state.clone())
+        .oneshot(get_request("/simple/oldpkg/", Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let html = body_text(res.into_body()).await;
+    assert!(html.contains("oldpkg-1.0.tar.gz"), "{html}");
+
+    // Mixed project lists only the old file.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/mixedpkg/",
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let files = json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "{text}");
+    assert_eq!(files[0]["filename"], "mixedpkg-old.tar.gz");
+    let res = build_router(state.clone())
+        .oneshot(get_request("/simple/mixedpkg/", Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let html = body_text(res.into_body()).await;
+    assert!(html.contains("mixedpkg-old.tar.gz"), "{html}");
+    assert!(!html.contains("mixedpkg-new.tar.gz"), "{html}");
+}
+
+#[tokio::test]
+async fn quarantine_per_package_override() {
+    // Default 3d, requests held 10d, torch exempt: the 5d-old requests file
+    // (visible under the default) stays hidden, while the 1h-old torch file
+    // (hidden under the default) serves.
+    let (state, _tmp) =
+        quarantine_index_app(test_policy(3, &[("requests", 10), ("torch", 0)])).await;
+
+    for accept in [None, Some(JSON_ACCEPT)] {
+        let res = build_router(state.clone())
+            .oneshot(get_request("/simple/requests/", Some(good_auth()), accept))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "accept={accept:?}");
+    }
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/torch/",
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["files"].as_array().unwrap().len(), 1, "{text}");
+    assert_eq!(json["files"][0]["filename"], "torch-9.9.tar.gz");
+}
+
+#[tokio::test]
+async fn quarantine_download_blocked_even_when_warm() {
+    const PROJECT: &str = "qdlpkg";
+    const YOUNG_FILE: &str = "qdlpkg-2.0.tar.gz";
+    const OLD_FILE: &str = "qdlpkg-1.0.tar.gz";
+    const YOUNG_BYTES: &[u8] = b"young quarantined bytes must never serve";
+    const OLD_BYTES: &[u8] = b"old released bytes serve normally";
+    let now = unix_now();
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream_and_policy(
+        vec![
+            FakeUpstreamFile {
+                project: PROJECT,
+                filename: YOUNG_FILE,
+                index_sha256: sha256_hex(YOUNG_BYTES),
+                bytes: YOUNG_BYTES.to_vec(),
+                upload_time: Some(rfc3339(now - 3600)),
+            },
+            FakeUpstreamFile {
+                project: PROJECT,
+                filename: OLD_FILE,
+                index_sha256: sha256_hex(OLD_BYTES),
+                bytes: OLD_BYTES.to_vec(),
+                upload_time: Some(rfc3339(now - 30 * 86_400)),
+            },
+        ],
+        test_policy(3, &[]),
+    )
+    .await;
+    let young_url = format!("/files/{PROJECT}/{YOUNG_FILE}");
+
+    // Young download 404s without fetching bytes.
+    let res = build_router(state.clone())
+        .oneshot(get_request(&young_url, Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fake.file_hits(), 0, "quarantined file must not fetch");
+
+    // A warm cache entry does not release it either.
+    seed_warm_cache(&state, PROJECT, YOUNG_FILE, YOUNG_BYTES).await;
+    let res = build_router(state.clone())
+        .oneshot(get_request(&young_url, Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fake.file_hits(), 0, "quarantined file must not fetch");
+
+    // The old file still cold-fetches, caches, and serves with policy active.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/files/{PROJECT}/{OLD_FILE}"),
+            Some(good_auth()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, OLD_BYTES);
+    assert_eq!(fake.file_hits(), 1);
+}
+
+#[tokio::test]
+async fn quarantine_missing_upload_time_fail_closed() {
+    // The legacy fake index omits upload-time entirely, and the HTML
+    // fallback has no timestamps: under quarantine both read as missing.
+    let (base, _counter) = spawn_fake_upstream().await;
+    let client = UpstreamClient::new(
+        base,
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (_app, state, _tmp) =
+        test_app_with_upstream_and_policy(Some(client), test_policy(3, &[])).await;
+    for project in ["purepkg", "htmlpkg", "demo-pkg"] {
+        let res = build_router(state.clone())
+            .oneshot(get_request(
+                &format!("/simple/{project}/"),
+                Some(good_auth()),
+                Some(JSON_ACCEPT),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "project={project}");
+    }
+    // Same shape via the quarantine fake's explicit no-timestamp project.
+    let (state, _tmp) = quarantine_index_app(test_policy(3, &[])).await;
+    let res = build_router(state.clone())
+        .oneshot(get_request("/simple/notimepkg/", Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    // Download side: unknown age 404s without fetching bytes.
+    const FILE: &str = "notimepkg-1.0.tar.gz";
+    const BYTES: &[u8] = b"bytes with unknown age must not serve";
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream_and_policy(
+        vec![FakeUpstreamFile {
+            project: "notimepkg",
+            filename: FILE,
+            index_sha256: sha256_hex(BYTES),
+            bytes: BYTES.to_vec(),
+            upload_time: None,
+        }],
+        test_policy(3, &[]),
+    )
+    .await;
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/files/notimepkg/{FILE}"),
+            Some(good_auth()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fake.file_hits(), 0);
+}
+
+#[tokio::test]
+async fn quarantine_hosted_never_quarantined() {
+    // Even a 365-day default cannot touch hosted files.
+    let base = spawn_quarantine_upstream().await;
+    let client = UpstreamClient::new(
+        base,
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (_app, state, _tmp) =
+        test_app_with_upstream_and_policy(Some(client), test_policy(365, &[])).await;
+
+    // Upload a hosted file under the young-upstream project.
+    const HOSTED_BYTES: &[u8] = b"hosted bytes always serve";
+    const HOSTED_FILE: &str = "youngpkg-1.0.tar.gz";
+    let digest = sha256_hex(HOSTED_BYTES);
+    let fields: Vec<(&str, &str)> = vec![
+        (":action", "file_upload"),
+        ("name", "YoungPkg"),
+        ("version", "1.0"),
+        ("sha256_digest", digest.as_str()),
+    ];
+    let body = build_multipart(
+        BOUNDARY,
+        &fields,
+        Some(("content", HOSTED_FILE, HOSTED_BYTES)),
+    );
+    let res = build_router(state.clone())
+        .oneshot(post_upload_request(Some(good_auth()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Index lists the hosted file (the young upstream file stays hidden).
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/youngpkg/",
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let files = json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "{text}");
+    assert_eq!(files[0]["filename"], HOSTED_FILE);
+
+    // Download serves hosted bytes.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/files/youngpkg/{HOSTED_FILE}"),
+            Some(good_auth()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, HOSTED_BYTES);
+}
+
+#[tokio::test]
+async fn quarantine_disabled_without_policy() {
+    // POLICY_FILE unset is Policy::default(): young upstream files serve.
+    let (state, _tmp) = quarantine_index_app(Policy::default()).await;
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/youngpkg/",
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["files"].as_array().unwrap().len(), 1, "{text}");
+
+    const FILE: &str = "freshpkg-2.0.tar.gz";
+    const BYTES: &[u8] = b"young bytes serve while quarantine is off";
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![FakeUpstreamFile {
+        project: "freshpkg",
+        filename: FILE,
+        index_sha256: sha256_hex(BYTES),
+        bytes: BYTES.to_vec(),
+        upload_time: Some(rfc3339(unix_now() - 60)),
+    }])
+    .await;
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/files/freshpkg/{FILE}"),
+            Some(good_auth()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, BYTES);
+    assert_eq!(fake.file_hits(), 1);
 }

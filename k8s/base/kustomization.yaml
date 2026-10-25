@@ -4,3 +4,4 @@ resources:
   - deployment.yaml
   - service.yaml
   - storage-pvc.yaml
+  - policy-configmap.yaml

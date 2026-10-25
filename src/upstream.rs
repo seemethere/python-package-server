@@ -8,7 +8,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
-use crate::config::Settings;
+use crate::config::{Policy, Settings};
 
 const JSON_ACCEPT: &str = "application/vnd.pypi.simple.v1+json";
 
@@ -28,6 +28,46 @@ pub struct UpstreamFile {
     pub requires_python: Option<String>,
     pub yanked: bool,
     pub yank_reason: Option<String>,
+    /// PEP 691 `upload-time` as unix seconds, `None` when the upstream
+    /// index omits it (notably the HTML fallback, which has no timestamps).
+    pub upload_time: Option<u64>,
+}
+
+/// Whether an upstream file is quarantined at `now_unix_secs`.
+///
+/// The project's quarantine days come from `policy` (per-package override
+/// or global default). `0` days never quarantines; an unknown `upload_time`
+/// fails closed (quarantined) whenever days are in force. Hosted files never
+/// reach this check.
+pub fn is_quarantined(
+    policy: &Policy,
+    file: &UpstreamFile,
+    normalized_project: &str,
+    now_unix_secs: u64,
+) -> bool {
+    const DAY_SECS: u64 = 86_400;
+    let days = policy.quarantine_days_for(normalized_project);
+    if days == 0 {
+        return false;
+    }
+    match file.upload_time {
+        None => true,
+        Some(uploaded) => {
+            let release = uploaded.saturating_add(u64::from(days).saturating_mul(DAY_SECS));
+            now_unix_secs < release
+        }
+    }
+}
+
+/// Current time as unix seconds for quarantine checks.
+///
+/// A pre-epoch clock reads as `0`, which quarantines everything while days
+/// are in force (fail closed) and is harmless when quarantine is off.
+pub fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Error)]
@@ -276,6 +316,8 @@ struct JsonFile {
     requires_python: Option<String>,
     #[serde(default)]
     yanked: Option<YankedValue>,
+    #[serde(default, rename = "upload-time")]
+    upload_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,9 +352,93 @@ fn parse_json_index(body: &str) -> Result<Vec<UpstreamFile>, UpstreamError> {
                 requires_python: f.requires_python,
                 yanked,
                 yank_reason,
+                // Unparseable timestamps fail closed per file (unknown age
+                // counts as quarantined) rather than failing the index.
+                upload_time: f.upload_time.as_deref().and_then(parse_upload_time),
             }
         })
         .collect())
+}
+
+/// Parse a PEP 691 `upload-time` (RFC 3339 UTC) to unix seconds.
+///
+/// Accepts `YYYY-MM-DDTHH:MM:SS[.fraction](Z|+00:00)` — the shape PyPI
+/// emits, e.g. `2023-01-01T12:00:00.123456Z`. Any other offset or malformed
+/// input returns `None` so the caller fails closed. Pre-1970 dates saturate
+/// to `Some(0)` (old enough to never quarantine).
+fn parse_upload_time(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    let datetime = if raw.ends_with('Z') || raw.ends_with('z') {
+        &raw[..raw.len() - 1]
+    } else {
+        raw.strip_suffix("+00:00")?
+    };
+    let (date, time) = datetime.split_once(['T', 't'])?;
+    let mut date_parts = date.split('-');
+    let (year, month, day) = (
+        date_parts.next()?.parse::<i64>().ok()?,
+        date_parts.next()?.parse::<i64>().ok()?,
+        date_parts.next()?.parse::<i64>().ok()?,
+    );
+    if date_parts.next().is_some()
+        || year > 9999
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+    {
+        return None;
+    }
+    let mut time_parts = time.split(':');
+    let (hour, minute, second) = (
+        time_parts.next()?.parse::<i64>().ok()?,
+        time_parts.next()?.parse::<i64>().ok()?,
+        time_parts.next()?.split('.').next()?.parse::<i64>().ok()?,
+    );
+    if time_parts.next().is_some()
+        || !(0..24).contains(&hour)
+        || !(0..60).contains(&minute)
+        || !(0..60).contains(&second)
+    {
+        return None;
+    }
+    // Reject non-digit fraction tails (`12:00:00.abc`); the value truncates.
+    if let Some((_, fraction)) = time.split_once('.') {
+        if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second;
+    Some(secs.max(0) as u64)
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let adjusted_year = if month <= 2 { year - 1 } else { year };
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = (month + 9) % 12;
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146097 + day_of_era - 719468
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+    }
 }
 
 fn html_unescape(s: &str) -> String {
@@ -518,6 +644,9 @@ fn parse_html_index(body: &str) -> Vec<UpstreamFile> {
             requires_python,
             yanked,
             yank_reason,
+            // PEP 503 HTML carries no timestamps; unknown age fails closed
+            // under quarantine (see `is_quarantined`).
+            upload_time: None,
         });
         pos = text_end + 4;
     }
@@ -680,5 +809,125 @@ mod tests {
         assert!(files[0].yanked);
         assert_eq!(files[0].yank_reason, None);
         assert!(parse_json_index("not json").is_err());
+    }
+
+    #[test]
+    fn parses_upload_time() {
+        // Epoch, a PyPI-shaped fractional timestamp, and +00:00 equivalence.
+        assert_eq!(parse_upload_time("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_upload_time("2023-01-01T12:00:00.123456Z"),
+            Some(1_672_574_400)
+        );
+        assert_eq!(
+            parse_upload_time("2023-01-01T12:00:00.123456+00:00"),
+            Some(1_672_574_400)
+        );
+        assert_eq!(
+            parse_upload_time("2023-01-01T12:00:00+00:00"),
+            Some(1_672_574_400)
+        );
+        // Leap day and fraction truncation.
+        assert_eq!(
+            parse_upload_time("2024-02-29T00:00:00Z"),
+            Some(1_709_164_800)
+        );
+        assert_eq!(
+            parse_upload_time("2024-02-29T00:00:00.999Z"),
+            Some(1_709_164_800)
+        );
+        // Pre-1970 saturates to 0 (old enough to never quarantine).
+        assert_eq!(parse_upload_time("1960-05-05T00:00:00Z"), Some(0));
+
+        // Non-UTC offsets are rejected (callers fail closed).
+        for bad in [
+            "2023-01-01T12:00:00+05:00",
+            "2023-01-01T12:00:00-04:00",
+            "2023-01-01T12:00:00",
+            "2023-01-01 12:00:00Z",
+            "2023-13-01T12:00:00Z",
+            "2023-02-29T12:00:00Z",
+            "2023-01-32T12:00:00Z",
+            "2023-01-01T24:00:00Z",
+            "2023-01-01T12:60:00Z",
+            "2023-01-01T12:00:60Z",
+            "2023-01-01T12:00:00.Z",
+            "2023-01-01T12:00:00.abcZ",
+            "2023-01-01T12:00Z",
+            "not a timestamp",
+            "",
+        ] {
+            assert_eq!(parse_upload_time(bad), None, "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn json_index_carries_upload_time() {
+        let files = parse_json_index(
+            r#"{"files":[
+                {"filename":"a-1.tar.gz","url":"https://e/a","hashes":{"sha256":"aa"},"upload-time":"2023-01-01T12:00:00.123456Z"},
+                {"filename":"b-1.tar.gz","url":"https://e/b","hashes":{"sha256":"bb"}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(files[0].upload_time, Some(1_672_574_400));
+        assert_eq!(files[1].upload_time, None);
+        // HTML fallback never carries timestamps.
+        let files = parse_html_index(r#"<a href="/files/a-1.tar.gz#sha256=ff">a-1.tar.gz</a>"#);
+        assert_eq!(files[0].upload_time, None);
+    }
+
+    #[test]
+    fn quarantine_predicate_matrix() {
+        use std::collections::HashMap;
+        let policy = Policy {
+            quarantine_days_default: 3,
+            quarantine_days_by_project: HashMap::from([("torch".to_string(), 0)]),
+        };
+        let file_at = |upload_time: Option<u64>| UpstreamFile {
+            filename: "f.tar.gz".to_string(),
+            url: "https://e/f".to_string(),
+            sha256: String::new(),
+            requires_python: None,
+            yanked: false,
+            yank_reason: None,
+            upload_time,
+        };
+        let now = 1_672_574_400; // 2023-01-01T12:00:00Z
+        let day = 86_400;
+        // Young file quarantined, old file released, exact boundary released.
+        assert!(is_quarantined(
+            &policy,
+            &file_at(Some(now - day)),
+            "pkg",
+            now
+        ));
+        assert!(!is_quarantined(
+            &policy,
+            &file_at(Some(now - 4 * day)),
+            "pkg",
+            now
+        ));
+        assert!(!is_quarantined(
+            &policy,
+            &file_at(Some(now - 3 * day)),
+            "pkg",
+            now
+        ));
+        // Future upload quarantined (clock skew never releases early).
+        assert!(is_quarantined(
+            &policy,
+            &file_at(Some(now + day)),
+            "pkg",
+            now
+        ));
+        // Unknown age fails closed when days apply, open when 0.
+        assert!(is_quarantined(&policy, &file_at(None), "pkg", now));
+        assert!(!is_quarantined(&policy, &file_at(None), "torch", now));
+        assert!(!is_quarantined(&policy, &file_at(Some(now)), "torch", now));
+        // Zero-default policy never quarantines anything.
+        let off = Policy::default();
+        assert!(!is_quarantined(&off, &file_at(None), "pkg", now));
+        assert!(!is_quarantined(&off, &file_at(Some(now)), "pkg", now));
     }
 }

@@ -330,8 +330,8 @@ async fn cleanup(path: &std::path::Path) {
 /// Otherwise serves warm bytes, or cold-fetches, verifies, and caches them.
 /// Records exactly one `upstream_file_fetches_total` outcome per call: `hit`
 /// (warm serve, no fetch), `miss` (fetched + cached), or `error` (any failure
-/// to serve through this path, including unknown filenames and oversize or
-/// unverifiable upstream files).
+/// to serve through this path, including unknown filenames, quarantine
+/// blocks, and oversize or unverifiable upstream files).
 async fn fetch_upstream(
     state: &AppState,
     project: &str,
@@ -342,6 +342,42 @@ async fn fetch_upstream(
     };
     if client.is_private_only(project) {
         return Err(AppError::NotFound(format!("file {filename} not found")));
+    }
+    // Quarantine gate: resolve the index entry BEFORE warm cache or fetch,
+    // so cached bytes are never served for a currently-quarantined file.
+    // The lookup usually hits the TTL index cache (no extra upstream I/O).
+    if state.settings.policy.quarantine_days_for(project) > 0 {
+        let now = crate::upstream::now_unix_secs();
+        let file = match client.file_for(project, filename).await {
+            Ok(Some(file)) => file,
+            Ok(None) => {
+                metrics::counter!("upstream_file_fetches_total", "result" => "error").increment(1);
+                return Err(AppError::NotFound(format!("file {filename} not found")));
+            }
+            Err(err) => {
+                // Fail closed: without index metadata the file's age is
+                // unknown, so a quarantined project cannot serve it — even
+                // from warm cache. Outage tradeoff: while upstream (or its
+                // cached index) is unavailable, quarantined-project downloads
+                // 404; projects with 0 days keep serving warm bytes, since
+                // they skip this gate entirely.
+                tracing::warn!(
+                    project,
+                    filename,
+                    "quarantine fail-closed: upstream index unavailable: {err}"
+                );
+                metrics::counter!("upstream_quarantine_filtered_total", "stage" => "download")
+                    .increment(1);
+                metrics::counter!("upstream_file_fetches_total", "result" => "error").increment(1);
+                return Err(AppError::NotFound(format!("file {filename} not found")));
+            }
+        };
+        if crate::upstream::is_quarantined(&state.settings.policy, &file, project, now) {
+            metrics::counter!("upstream_quarantine_filtered_total", "stage" => "download")
+                .increment(1);
+            metrics::counter!("upstream_file_fetches_total", "result" => "error").increment(1);
+            return Err(AppError::NotFound(format!("file {filename} not found")));
+        }
     }
     // Warm bytes serve without touching upstream, so an expired index entry
     // or a downed upstream never breaks already-cached downloads.

@@ -25,6 +25,8 @@ fn test_settings(endpoint: String, staging_dir: PathBuf) -> Settings {
         upstream_url: None,
         upstream_index_ttl_secs: 300,
         upstream_private_only_projects: std::collections::HashSet::new(),
+        policy_file: None,
+        policy: python_package_server::config::Policy::default(),
     }
 }
 
