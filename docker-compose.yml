@@ -23,6 +23,8 @@ services:
       STORAGE_DIR: /data
       AUTH_TOKEN_FILE: /secrets/tokens
       RUST_LOG: info
+      # Upstream pull-through (disabled by default; uncomment to enable):
+      # UPSTREAM_URL: https://pypi.org/simple/
     volumes:
       - ./data:/data
       - ./dev.tokens:/secrets/tokens:ro

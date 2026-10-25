@@ -11,6 +11,8 @@ resources:
 #   S3_ENDPOINT_URL=http://minio:9000 to the container;
 # - provide credentials via the secret (AWS_ACCESS_KEY_ID /
 #   AWS_SECRET_ACCESS_KEY env entries) or your platform's IAM role.
+# - for upstream pull-through, add an UPSTREAM_URL env entry
+#   (see the commented example in the base deployment).
 patches:
   - target:
       kind: Deployment

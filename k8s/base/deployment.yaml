@@ -43,6 +43,10 @@ spec:
                 secretKeyRef:
                   name: package-server-secrets
                   key: DATABASE_URL
+            # Optional upstream pull-through (disabled by default). To enable,
+            # add an UPSTREAM_URL entry, e.g.:
+            # - name: UPSTREAM_URL
+            #   value: https://pypi.org/simple/
           volumeMounts:
             - mountPath: /data
               name: data

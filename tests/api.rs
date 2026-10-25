@@ -2387,3 +2387,272 @@ async fn warm_cache_normalizes_uppercase_sidecar() {
     assert_eq!(fake.index_hits(), 0, "warm hit must skip the index");
     assert_eq!(fake.file_hits(), 0, "warm hit must skip file fetch");
 }
+
+#[tokio::test]
+async fn health_ok_while_upstream_down() {
+    // Dead port: nothing listens here, so any upstream call would fail fast.
+    // /health checks only db + storage, never upstream.
+    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = dead_listener.local_addr().unwrap().port();
+    drop(dead_listener);
+    let client = UpstreamClient::new(
+        format!("http://127.0.0.1:{dead_port}/"),
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (app, _state, _tmp) = test_app_with_upstream(Some(client)).await;
+    let res = app
+        .oneshot(get_request("/health", None, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["db"], "up");
+    assert_eq!(json["storage"], "up");
+}
+
+#[tokio::test]
+async fn upstream_file_redirect_is_followed_and_verified() {
+    use axum::response::IntoResponse;
+    const PROJECT: &str = "redirpkg";
+    const FILE: &str = "redirpkg-1.0.tar.gz";
+    const BYTES: &[u8] = b"redirected upstream bytes verified by sha256";
+    let sha = sha256_hex(BYTES);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}/");
+    let index_base = base.clone();
+    let redirect_base = base.clone();
+    let index_sha = sha.clone();
+    let index_hits = Arc::new(AtomicUsize::new(0));
+    let redirect_hits = Arc::new(AtomicUsize::new(0));
+    let file_hits = Arc::new(AtomicUsize::new(0));
+    let ih = index_hits.clone();
+    let rh = redirect_hits.clone();
+    let fh = file_hits.clone();
+    let app = Router::new()
+        .route(
+            "/{project}/",
+            axum::routing::get(
+                move |axum::extract::Path(project): axum::extract::Path<String>| {
+                    let ih = ih.clone();
+                    let base = index_base.clone();
+                    let sha = index_sha.clone();
+                    async move {
+                        ih.fetch_add(1, Ordering::SeqCst);
+                        if project != PROJECT {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        axum::Json(serde_json::json!({
+                            "meta": {"api-version": "1.1"},
+                            "name": PROJECT,
+                            "files": [{
+                                "filename": FILE,
+                                "url": format!("{base}redirect/{FILE}"),
+                                "hashes": {"sha256": sha},
+                                "requires-python": null,
+                                "yanked": false,
+                            }]
+                        }))
+                        .into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/redirect/{filename}",
+            axum::routing::get(
+                move |axum::extract::Path(filename): axum::extract::Path<String>| {
+                    let rh = rh.clone();
+                    let base = redirect_base.clone();
+                    async move {
+                        rh.fetch_add(1, Ordering::SeqCst);
+                        if filename != FILE {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        (
+                            StatusCode::FOUND,
+                            [(header::LOCATION, format!("{base}files/{FILE}"))],
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/files/{filename}",
+            axum::routing::get(
+                move |axum::extract::Path(filename): axum::extract::Path<String>| {
+                    let fh = fh.clone();
+                    async move {
+                        fh.fetch_add(1, Ordering::SeqCst);
+                        if filename != FILE {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        (
+                            [(header::CONTENT_TYPE, "application/octet-stream")],
+                            BYTES.to_vec(),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = UpstreamClient::new(
+        base,
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (_app, state, _tmp) = test_app_with_upstream(Some(client)).await;
+    let url = format!("/files/{PROJECT}/{FILE}");
+    let res = build_router(state.clone())
+        .oneshot(get_request(&url, Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(header::ETAG).unwrap(),
+        &format!("\"{sha}\"")
+    );
+    assert_eq!(body_bytes(res.into_body()).await, BYTES);
+    assert_eq!(index_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        redirect_hits.load(Ordering::SeqCst),
+        1,
+        "redirect must be followed"
+    );
+    assert_eq!(
+        file_hits.load(Ordering::SeqCst),
+        1,
+        "redirect target must be fetched"
+    );
+}
+
+#[tokio::test]
+async fn upstream_percent_encoded_filename_round_trips() {
+    // '+' percent-encodes as %2B in our index URLs and must decode back
+    // to the exact upstream filename on download.
+    const PROJECT: &str = "encpkg";
+    const FILE: &str = "encpkg-1.0+local.tar.gz";
+    const BYTES: &[u8] = b"bytes for percent-encoded filename round-trip";
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![FakeUpstreamFile {
+        project: PROJECT,
+        filename: FILE,
+        index_sha256: sha256_hex(BYTES),
+        bytes: BYTES.to_vec(),
+    }])
+    .await;
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/simple/{PROJECT}/"),
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = body_text(res.into_body()).await;
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["files"][0]["filename"], FILE);
+    assert_eq!(
+        json["files"][0]["url"],
+        format!("/files/{PROJECT}/encpkg-1.0%2Blocal.tar.gz")
+    );
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/files/{PROJECT}/encpkg-1.0%2Blocal.tar.gz"),
+            Some(good_auth()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, BYTES);
+    assert_eq!(fake.index_hits(), 1);
+    assert_eq!(fake.file_hits(), 1);
+}
+
+#[tokio::test]
+async fn upstream_empty_file_list_is_404() {
+    use axum::response::IntoResponse;
+    let app = Router::new().route(
+        "/{project}/",
+        axum::routing::get(
+            |axum::extract::Path(project): axum::extract::Path<String>| async move {
+                if project == "emptypkg" {
+                    axum::Json(serde_json::json!({
+                        "meta": {"api-version": "1.1"},
+                        "name": "emptypkg",
+                        "files": [],
+                    }))
+                    .into_response()
+                } else {
+                    StatusCode::NOT_FOUND.into_response()
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = UpstreamClient::new(
+        format!("http://{addr}/"),
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (_app, state, _tmp) = test_app_with_upstream(Some(client)).await;
+
+    // 200 with zero files and no hosted files is still a 404, both formats.
+    for accept in [None, Some(JSON_ACCEPT)] {
+        let res = build_router(state.clone())
+            .oneshot(get_request("/simple/emptypkg/", Some(good_auth()), accept))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn upstream_private_only_denylist_is_normalized() {
+    // Config-level: "Demo_Pkg" normalizes to "demo-pkg", so a denylist
+    // entry in any spelling matches the normalized request path.
+    let normalized = python_package_server::packaging::normalize_project("Demo_Pkg").unwrap();
+    assert_eq!(normalized.as_str(), "demo-pkg");
+    // Predicate-level via a Settings-built client (no env races).
+    let mut settings = test_settings(std::env::temp_dir());
+    settings.upstream_url = Some("http://127.0.0.1:9/".to_string());
+    settings
+        .upstream_private_only_projects
+        .insert(normalized.to_string());
+    let client = UpstreamClient::from_settings(&settings).expect("upstream client from settings");
+    assert!(client.is_private_only("demo-pkg"));
+    assert!(!client.is_private_only("other"));
+
+    // End-to-end: a mixed-case request spelling still hits the denylist.
+    let (base, counter) = spawn_fake_upstream().await;
+    let mut private = std::collections::HashSet::new();
+    private.insert("demo-pkg".to_string());
+    let client = UpstreamClient::new(base, std::time::Duration::from_secs(60), private);
+    let (_app, state, _tmp) = test_app_with_upstream(Some(client)).await;
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/Demo_Pkg/",
+            Some(good_auth()),
+            Some(JSON_ACCEPT),
+        ))
+        .await
+        .unwrap();
+    // No hosted files + denylisted => 404 without any upstream call
+    // (the fake would otherwise serve two files for demo-pkg).
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+}
