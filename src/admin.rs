@@ -25,6 +25,7 @@ use crate::{
     auth::AuthenticatedUser,
     db::{MetadataStore, ProjectRecord},
     error::AppError,
+    files::{sidecar_filename, SIDECAR_PROJECT},
     packaging::normalize_project,
     state::AppState,
 };
@@ -173,7 +174,8 @@ pub async fn unyank_file(
 /// Permanently delete one file: index row first, then stored bytes.
 ///
 /// Deleting the row first keeps the index authoritative. A failed byte
-/// removal only leaves an invisible orphan object and is logged.
+/// removal only leaves an invisible orphan object and is logged. Any
+/// shadowing upstream-cache sidecar is removed best-effort as well.
 pub async fn delete_file(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -190,6 +192,17 @@ pub async fn delete_file(
             filename = filename.as_str(),
             error = %err,
             "file row deleted but object removal failed"
+        );
+    }
+    // Mirror hosted upload: drop any shadowing cache sidecar so no stale
+    // stamp outlives the deleted bytes. Best-effort, like the bytes removal.
+    let sidecar = sidecar_filename(&normalized, &filename);
+    if let Err(err) = state.storage.delete(SIDECAR_PROJECT, &sidecar).await {
+        tracing::warn!(
+            project = normalized.as_str(),
+            filename = filename.as_str(),
+            error = %err,
+            "file row deleted but sidecar removal failed"
         );
     }
     metrics::counter!("file_deletes_total").increment(1);

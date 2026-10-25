@@ -10,10 +10,16 @@ use python_package_server::{
     build_router,
     config::Settings,
     db::{MetadataBackend, PgStore},
-    reconcile::reconcile,
+    reconcile::{reconcile, sweep_upstream_cache},
     state::AppState,
     storage::Storage,
 };
+
+/// Interval between background upstream-cache eviction sweeps.
+///
+/// Lazy expiry on the download path keeps serving correct; this loop only
+/// reclaims disk from entries nobody requests anymore.
+const UPSTREAM_CACHE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
 #[tokio::main]
 async fn main() {
@@ -88,6 +94,29 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Age out stale pull-through cache entries once at startup, after the
+    // metrics install so the sweep's eviction counter registers. Infallible
+    // by design: failures log and startup continues.
+    sweep_upstream_cache(&db, &storage, settings.upstream_cache_max_age_days).await;
+
+    // The same sweep repeats in the background; a 0-day TTL disables both.
+    if settings.upstream_cache_max_age_days > 0 {
+        let sweep_db = db.clone();
+        let sweep_storage = storage.clone();
+        let sweep_max_age_days = settings.upstream_cache_max_age_days;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(UPSTREAM_CACHE_SWEEP_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The first tick completes immediately; consume it so the loop
+            // sweeps on the interval instead of re-running the startup sweep.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                sweep_upstream_cache(&sweep_db, &sweep_storage, sweep_max_age_days).await;
+            }
+        });
+    }
 
     let upstream = python_package_server::upstream::UpstreamClient::from_settings(&settings);
     let state = AppState {

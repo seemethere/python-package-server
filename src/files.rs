@@ -311,12 +311,63 @@ async fn serve_stored(
 /// `.upstream-cache` can never be a normalized project name (names must start
 /// with a letter or digit), so hosted uploads, admin deletes, and metadata
 /// rows can never collide with these keys.
-const SIDECAR_PROJECT: &str = ".upstream-cache";
+pub(crate) const SIDECAR_PROJECT: &str = ".upstream-cache";
+
+/// Suffix of every cache sidecar key; the sweep lists these to enumerate entries.
+pub(crate) const SIDECAR_SUFFIX: &str = ".sha256";
 
 /// Sidecar key for cached `(project, filename)` bytes; the content is the
-/// lowercase hex sha256, letting warm hits build ETags without the index.
-fn sidecar_filename(project: &str, filename: &str) -> String {
-    format!("{project}--{filename}.sha256")
+/// lowercase hex sha256 plus a fetch timestamp (see [`format_sidecar`]),
+/// letting warm hits build ETags without the index.
+pub(crate) fn sidecar_filename(project: &str, filename: &str) -> String {
+    format!("{project}--{filename}{SIDECAR_SUFFIX}")
+}
+
+/// Sidecar body for a fresh cache fill: the lowercase hex sha256, then the
+/// fetch time as unix seconds, one per line.
+pub(crate) fn format_sidecar(sha256: &str, cached_at_unix_secs: u64) -> String {
+    format!("{sha256}\n{cached_at_unix_secs}\n")
+}
+
+/// Parse a sidecar body into `(lowercase sha256, fetch time)`.
+///
+/// Legacy plain-hash sidecars (no second line) parse with unknown age
+/// (`None`), so they refresh once under a live TTL instead of breaking.
+/// Anything else malformed — bad hash or unparsable timestamp — is `None`
+/// (cold), exactly like the pre-timestamp reader. Trailing lines are ignored.
+pub(crate) fn parse_sidecar(text: &str) -> Option<(String, Option<u64>)> {
+    let mut lines = text.lines();
+    let sha256 = lines.next()?.trim();
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let cached_at = match lines.next() {
+        None => None,
+        Some(stamp) => Some(stamp.trim().parse::<u64>().ok()?),
+    };
+    Some((sha256.to_ascii_lowercase(), cached_at))
+}
+
+/// Whether a cached entry has outlived `max_age_days` at `now_unix_secs`.
+///
+/// `0` days never expires. Unknown-age (legacy) entries count as expired
+/// whenever expiry is enabled, so they re-fetch once and gain a stamp.
+/// Future stamps (clock skew) read as age zero, never expired.
+pub(crate) fn cache_entry_expired(
+    max_age_days: u32,
+    cached_at: Option<u64>,
+    now_unix_secs: u64,
+) -> bool {
+    const DAY_SECS: u64 = 86_400;
+    if max_age_days == 0 {
+        return false;
+    }
+    match cached_at {
+        None => true,
+        Some(stamped) => {
+            now_unix_secs.saturating_sub(stamped) > u64::from(max_age_days).saturating_mul(DAY_SECS)
+        }
+    }
 }
 
 /// Best-effort removal of a staging file.
@@ -380,14 +431,15 @@ async fn fetch_upstream(
         }
     }
     // Warm bytes serve without touching upstream, so an expired index entry
-    // or a downed upstream never breaks already-cached downloads.
-    if let Some(hit) = warm_cache_checked(state, project, filename).await? {
+    // or a downed upstream never breaks already-cached downloads. Entries
+    // past the age TTL evict here and refill below like a cold miss.
+    if let Some(hit) = warm_cache_fresh_or_evict(state, project, filename).await? {
         metrics::counter!("upstream_file_fetches_total", "result" => "hit").increment(1);
         return Ok(hit);
     }
     let permit = client.acquire_fetch(project, filename).await;
     // A waiter re-checks: the previous holder may have filled the cache.
-    if let Some(hit) = warm_cache_checked(state, project, filename).await? {
+    if let Some(hit) = warm_cache_fresh_or_evict(state, project, filename).await? {
         metrics::counter!("upstream_file_fetches_total", "result" => "hit").increment(1);
         drop(permit);
         return Ok(hit);
@@ -406,13 +458,15 @@ async fn fetch_upstream(
     }
 }
 
-/// Warm-hit probe: stored bytes plus a valid sidecar hash, with zero upstream
-/// I/O. `None` means cold (or an unusable entry the cold path re-fetches).
+/// Warm-hit probe: stored bytes plus a valid sidecar, with zero upstream
+/// I/O. Returns the lowercase hash, byte size, and fetch time (`None` for
+/// legacy plain-hash sidecars). `None` means cold (or an unusable entry
+/// the cold path re-fetches).
 async fn warm_cache(
     state: &AppState,
     project: &str,
     filename: &str,
-) -> Result<Option<(String, u64)>, AppError> {
+) -> Result<Option<(String, u64, Option<u64>)>, AppError> {
     let Some(size) = state.storage.stat(project, filename).await? else {
         return Ok(None);
     };
@@ -425,14 +479,12 @@ async fn warm_cache(
         .await
         .map_err(|err| internal(format!("read cache sidecar: {err}")))?
         .to_bytes();
-    let Ok(sha256) = std::str::from_utf8(&bytes) else {
+    let Ok(text) = std::str::from_utf8(&bytes) else {
         return Ok(None);
     };
-    let sha256 = sha256.trim();
-    if sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(Some((sha256.to_ascii_lowercase(), size)))
-    } else {
-        Ok(None)
+    match parse_sidecar(text) {
+        Some((sha256, cached_at)) => Ok(Some((sha256, size, cached_at))),
+        None => Ok(None),
     }
 }
 
@@ -442,11 +494,73 @@ async fn warm_cache_checked(
     state: &AppState,
     project: &str,
     filename: &str,
-) -> Result<Option<(String, u64)>, AppError> {
+) -> Result<Option<(String, u64, Option<u64>)>, AppError> {
     warm_cache(state, project, filename).await.map_err(|err| {
         metrics::counter!("upstream_file_fetches_total", "result" => "error").increment(1);
         err
     })
+}
+
+/// Fresh warm hit, or `None` when cold. Entries past the age TTL are evicted
+/// here — bytes + sidecar deleted, `upstream_cache_evictions_total` counted
+/// with `source="lazy"` — and read as cold so the caller re-fetches them.
+/// Deletes are best-effort: the refill overwrites both keys regardless.
+/// A hosted row always wins: before deleting, the DB is re-checked, since
+/// an upload may have published this key between the handler's DB-miss and
+/// this lazy delete. A newly hosted key is served, never deleted.
+async fn warm_cache_fresh_or_evict(
+    state: &AppState,
+    project: &str,
+    filename: &str,
+) -> Result<Option<(String, u64)>, AppError> {
+    let hit = warm_cache_checked(state, project, filename).await?;
+    let Some((sha256, size, cached_at)) = hit else {
+        return Ok(None);
+    };
+    if !cache_entry_expired(
+        state.settings.upstream_cache_max_age_days,
+        cached_at,
+        crate::upstream::now_unix_secs(),
+    ) {
+        return Ok(Some((sha256, size)));
+    }
+    // Hosted re-check before ANY delete: an upload that landed after the
+    // handler's DB-miss leaves hosted bytes beside this stale sidecar, and
+    // deleting them would destroy hosted data. Serve the hosted entry
+    // instead; a lookup failure also aborts (counted, like any error on
+    // this path) so unverified keys are never deleted.
+    match hosted_during_fetch(state, project, filename).await {
+        Ok(Some(hosted)) => return Ok(Some(hosted)),
+        Ok(None) => {}
+        Err(err) => {
+            metrics::counter!("upstream_file_fetches_total", "result" => "error").increment(1);
+            return Err(err);
+        }
+    }
+    tracing::info!(
+        project,
+        filename,
+        "evicting expired upstream cache entry (lazy)"
+    );
+    metrics::counter!("upstream_cache_evictions_total", "source" => "lazy").increment(1);
+    if let Err(err) = state.storage.delete(project, filename).await {
+        tracing::warn!(
+            project,
+            filename,
+            error = %err,
+            "lazy eviction: failed to delete cached bytes"
+        );
+    }
+    let sidecar = sidecar_filename(project, filename);
+    if let Err(err) = state.storage.delete(SIDECAR_PROJECT, &sidecar).await {
+        tracing::warn!(
+            project,
+            filename,
+            error = %err,
+            "lazy eviction: failed to delete cache sidecar"
+        );
+    }
+    Ok(None)
 }
 
 /// Cold-miss fill: resolve via the upstream index, stream-download to staging
@@ -581,7 +695,8 @@ async fn hosted_during_fetch(
     }
 }
 
-/// Cache the verified hash sidecar for `(project, filename)`.
+/// Cache the verified hash sidecar for `(project, filename)`, stamped with
+/// the fetch time so age eviction can tell fresh entries from stale ones.
 async fn put_sidecar(
     state: &AppState,
     project: &str,
@@ -589,7 +704,8 @@ async fn put_sidecar(
     sha256: &str,
 ) -> Result<(), AppError> {
     let (staging, mut dest) = state.storage.create_staging_file().await?;
-    if let Err(err) = dest.write_all(sha256.as_bytes()).await {
+    let body = format_sidecar(sha256, crate::upstream::now_unix_secs());
+    if let Err(err) = dest.write_all(body.as_bytes()).await {
         drop(dest);
         cleanup(&staging).await;
         return Err(internal(format!("write sidecar staging file: {err}")));
@@ -693,6 +809,180 @@ mod tests {
         // Invalid specs stay ignored even for empty objects.
         assert_eq!(parse_range("bytes=abc-def", 0), ParsedRange::Ignore);
         assert_eq!(parse_range("bytes=5-3", 0), ParsedRange::Ignore);
+    }
+
+    #[test]
+    fn sidecar_format_round_trips() {
+        let hash = "ab".repeat(32);
+        let body = format_sidecar(&hash, 1_672_574_400);
+        assert_eq!(body, format!("{hash}\n1672574400\n"));
+        assert_eq!(
+            parse_sidecar(&body),
+            Some((hash.clone(), Some(1_672_574_400)))
+        );
+        // Trailing lines are ignored; surrounding whitespace is tolerated.
+        assert_eq!(
+            parse_sidecar(&format!("  {hash}  \n  1672574400  \nignored\n")),
+            Some((hash.clone(), Some(1_672_574_400)))
+        );
+    }
+
+    #[test]
+    fn sidecar_read_stays_backward_compatible() {
+        let hash = "ab".repeat(32);
+        // Legacy plain-hash sidecars parse with unknown age ...
+        assert_eq!(parse_sidecar(&hash), Some((hash.clone(), None)));
+        assert_eq!(
+            parse_sidecar(&format!("{hash}\n")),
+            Some((hash.clone(), None))
+        );
+        // ... and keep the lowercase ETag normalization.
+        let upper = hash.to_ascii_uppercase();
+        assert_eq!(
+            parse_sidecar(&format!("{upper}\n1672574400")),
+            Some((hash.clone(), Some(1_672_574_400)))
+        );
+        // Garbage stays cold, exactly like the pre-timestamp reader.
+        for bad in [
+            "",
+            "   ",
+            "not-a-hash",
+            &"zz".repeat(32),
+            &"ab".repeat(31),
+            &format!("{}\nnot-a-number", hash),
+            &format!("{}\n-5", hash),
+            &format!("{}\n", "x".repeat(64)),
+        ] {
+            assert_eq!(parse_sidecar(bad), None, "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn cache_expiry_matrix() {
+        const DAY: u64 = 86_400;
+        let now = 1_700_000_000;
+        // TTL 0 never expires, even for unknown-age entries.
+        assert!(!cache_entry_expired(0, None, now));
+        assert!(!cache_entry_expired(0, Some(0), now));
+        // Legacy unknown-age entries expire whenever a TTL applies.
+        assert!(cache_entry_expired(30, None, now));
+        // Fresh and boundary ages serve; only ages past the TTL evict.
+        assert!(!cache_entry_expired(30, Some(now), now));
+        assert!(!cache_entry_expired(30, Some(now - 29 * DAY), now));
+        assert!(!cache_entry_expired(30, Some(now - 30 * DAY), now));
+        assert!(cache_entry_expired(30, Some(now - 30 * DAY - 1), now));
+        assert!(cache_entry_expired(30, Some(0), now));
+        assert!(cache_entry_expired(1, Some(now - DAY - 1), now));
+        assert!(!cache_entry_expired(1, Some(now - DAY), now));
+        // Future stamps (clock skew) read as age zero, never expired.
+        assert!(!cache_entry_expired(30, Some(now + DAY), now));
+        assert!(!cache_entry_expired(30, Some(u64::MAX), now));
+    }
+
+    #[tokio::test]
+    async fn lazy_eviction_serves_hosted_instead_of_deleting() {
+        use crate::{
+            auth::Auth,
+            config::{Policy, Settings},
+            db::{MemoryStore, MetadataBackend, MetadataStore, NewFile},
+            state::AppState,
+            storage::Storage,
+        };
+
+        const PROJECT: &str = "racepkg";
+        const FILE: &str = "racepkg-1.0.tar.gz";
+        const BYTES: &[u8] = b"hosted bytes beside a stale sidecar";
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::filesystem(dir.path().to_path_buf());
+        storage.ensure_dirs().await.unwrap();
+        // Hosted bytes plus an ancient sidecar: the state an upload that
+        // landed between the handler's DB-miss and the lazy delete leaves.
+        let staged = storage.stage_path().unwrap();
+        tokio::fs::write(&staged, BYTES).await.unwrap();
+        storage.put_file(PROJECT, FILE, &staged).await.unwrap();
+        let staged = storage.stage_path().unwrap();
+        let stale = format_sidecar(&"ab".repeat(32), 0);
+        tokio::fs::write(&staged, stale.as_bytes()).await.unwrap();
+        storage
+            .put_file(SIDECAR_PROJECT, &sidecar_filename(PROJECT, FILE), &staged)
+            .await
+            .unwrap();
+
+        let db = MetadataBackend::Memory(MemoryStore::new());
+        // Hosted sha deliberately differs from the stale sidecar hash: the
+        // served entry must come from the row, proving the hosted path won.
+        let hosted_sha = "cd".repeat(32);
+        db.insert_file(&NewFile {
+            project_normalized: PROJECT.to_string(),
+            project_display: "RacePkg".to_string(),
+            filename: FILE.to_string(),
+            version: "1.0".to_string(),
+            sha256: hosted_sha.clone(),
+            size_bytes: BYTES.len() as i64,
+            requires_python: None,
+            uploaded_by: "ci".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let settings = Settings {
+            bind_addr: "127.0.0.1:0".to_string(),
+            database_url: "postgres://localhost/packages".to_string(),
+            storage_backend: "filesystem".to_string(),
+            storage_dir: dir.path().to_path_buf(),
+            s3_bucket: None,
+            s3_region: None,
+            s3_endpoint_url: None,
+            auth_token_file: std::path::PathBuf::from("/dev/null"),
+            max_upload_bytes: 1024 * 1024,
+            upstream_url: None,
+            upstream_index_ttl_secs: 300,
+            upstream_cache_max_age_days: 30,
+            upstream_private_only_projects: std::collections::HashSet::new(),
+            policy_file: None,
+            policy: Policy::default(),
+        };
+        let state = AppState {
+            db: db.clone(),
+            storage: storage.clone(),
+            auth: Auth::from_pairs(vec![("ci".to_string(), "secret".to_string())]),
+            metrics: metrics_exporter_prometheus::PrometheusBuilder::new()
+                .build_recorder()
+                .handle(),
+            settings: std::sync::Arc::new(settings),
+            upstream: None,
+        };
+
+        // Expired sidecar, but the hosted row wins: served, never deleted.
+        let hit = warm_cache_fresh_or_evict(&state, PROJECT, FILE)
+            .await
+            .unwrap();
+        assert_eq!(hit, Some((hosted_sha, BYTES.len() as u64)));
+
+        assert!(
+            db.get_file(PROJECT, FILE).await.unwrap().is_some(),
+            "hosted row must survive lazy eviction"
+        );
+        let (size, body) = storage
+            .get(PROJECT, FILE)
+            .await
+            .unwrap()
+            .expect("hosted bytes must survive lazy eviction");
+        assert_eq!(size, BYTES.len() as u64);
+        assert_eq!(
+            body.collect().await.unwrap().to_bytes().as_ref(),
+            BYTES,
+            "hosted bytes must be intact after lazy eviction"
+        );
+        assert!(
+            storage
+                .stat(SIDECAR_PROJECT, &sidecar_filename(PROJECT, FILE))
+                .await
+                .unwrap()
+                .is_some(),
+            "sidecar beside a hosted key must not be deleted"
+        );
     }
 
     #[test]

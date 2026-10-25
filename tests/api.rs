@@ -35,6 +35,7 @@ fn test_settings(storage_dir: PathBuf) -> Settings {
         max_upload_bytes: 1024 * 1024,
         upstream_url: None,
         upstream_index_ttl_secs: 300,
+        upstream_cache_max_age_days: 30,
         upstream_private_only_projects: std::collections::HashSet::new(),
         policy_file: None,
         policy: python_package_server::config::Policy::default(),
@@ -79,9 +80,18 @@ async fn test_app_with_upstream_and_policy(
     upstream: Option<UpstreamClient>,
     policy: Policy,
 ) -> (Router, AppState, tempfile::TempDir) {
+    test_app_with_upstream_policy_and_cache_ttl(upstream, policy, 30).await
+}
+
+async fn test_app_with_upstream_policy_and_cache_ttl(
+    upstream: Option<UpstreamClient>,
+    policy: Policy,
+    cache_max_age_days: u32,
+) -> (Router, AppState, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let mut settings = test_settings(tmp.path().to_path_buf());
     settings.policy = policy;
+    settings.upstream_cache_max_age_days = cache_max_age_days;
     let storage = Storage::filesystem(settings.storage_dir.clone());
     storage.ensure_dirs().await.unwrap();
     let db = MetadataBackend::Memory(MemoryStore::new());
@@ -1785,6 +1795,25 @@ async fn test_app_with_file_upstream_and_policy(
     (router, state, tmp, fake)
 }
 
+async fn test_app_with_file_upstream_and_cache_ttl(
+    files: Vec<FakeUpstreamFile>,
+    cache_max_age_days: u32,
+) -> (Router, AppState, tempfile::TempDir, FakeFileUpstream) {
+    let fake = spawn_fake_file_upstream(files).await;
+    let client = UpstreamClient::new(
+        fake.base.clone(),
+        std::time::Duration::from_secs(60),
+        std::collections::HashSet::new(),
+    );
+    let (router, state, tmp) = test_app_with_upstream_policy_and_cache_ttl(
+        Some(client),
+        Policy::default(),
+        cache_max_age_days,
+    )
+    .await;
+    (router, state, tmp, fake)
+}
+
 const CACHE_PROJECT: &str = "cachepkg";
 const CACHE_FILE: &str = "cachepkg-1.0.tar.gz";
 const CACHE_BYTES: &[u8] =
@@ -2364,7 +2393,6 @@ async fn cold_fill_aborts_when_hosted_upload_wins_race() {
 
 #[tokio::test]
 async fn warm_cache_normalizes_uppercase_sidecar() {
-    use tokio::io::AsyncWriteExt;
     const PROJECT: &str = "casepkg";
     const FILE: &str = "casepkg-1.0.tar.gz";
     const BYTES: &[u8] = b"bytes for uppercase sidecar test";
@@ -2377,27 +2405,11 @@ async fn warm_cache_normalizes_uppercase_sidecar() {
     );
     let (_app, state, _tmp) = test_app_with_upstream(Some(client)).await;
 
-    // Seed cached bytes plus an UPPERCASE hex sidecar directly.
-    let (staging, mut dest) = state.storage.create_staging_file().await.unwrap();
-    dest.write_all(BYTES).await.unwrap();
-    dest.flush().await.unwrap();
-    drop(dest);
-    state
-        .storage
-        .put_file(PROJECT, FILE, &staging)
-        .await
-        .unwrap();
+    // Seed cached bytes plus an UPPERCASE hex sidecar directly, stamped
+    // fresh so age expiry (not the case fold) is what this test exercises.
     let upper = sha256_hex(BYTES).to_ascii_uppercase();
-    let (staging2, mut dest2) = state.storage.create_staging_file().await.unwrap();
-    dest2.write_all(upper.as_bytes()).await.unwrap();
-    dest2.flush().await.unwrap();
-    drop(dest2);
-    let sidecar = format!("{PROJECT}--{FILE}.sha256");
-    state
-        .storage
-        .put_file(".upstream-cache", &sidecar, &staging2)
-        .await
-        .unwrap();
+    let body = format!("{upper}\n{}\n", unix_now());
+    seed_warm_cache_with_sidecar(&state, PROJECT, FILE, BYTES, &body).await;
 
     let url = format!("/files/{PROJECT}/{FILE}");
     let res = build_router(state.clone())
@@ -2795,8 +2807,22 @@ async fn quarantine_index_app(policy: Policy) -> (AppState, tempfile::TempDir) {
     (state, tmp)
 }
 
-/// Seed pull-through cache bytes + sidecar directly (lowercase hex hash).
+/// Seed pull-through cache bytes + sidecar directly (lowercase hex hash,
+/// stamped with the fetch time like a fresh cold fill).
 async fn seed_warm_cache(state: &AppState, project: &str, filename: &str, bytes: &[u8]) {
+    let body = format!("{}\n{}\n", sha256_hex(bytes), unix_now());
+    seed_warm_cache_with_sidecar(state, project, filename, bytes, &body).await;
+}
+
+/// Seed cache bytes with a caller-crafted sidecar body (backdated stamps,
+/// legacy plain-hash bodies) to control entry age without sleeping.
+async fn seed_warm_cache_with_sidecar(
+    state: &AppState,
+    project: &str,
+    filename: &str,
+    bytes: &[u8],
+    sidecar_body: &str,
+) {
     use tokio::io::AsyncWriteExt;
     let (staging, mut dest) = state.storage.create_staging_file().await.unwrap();
     dest.write_all(bytes).await.unwrap();
@@ -2807,19 +2833,36 @@ async fn seed_warm_cache(state: &AppState, project: &str, filename: &str, bytes:
         .put_file(project, filename, &staging)
         .await
         .unwrap();
-    let (staging2, mut dest2) = state.storage.create_staging_file().await.unwrap();
-    dest2.write_all(sha256_hex(bytes).as_bytes()).await.unwrap();
-    dest2.flush().await.unwrap();
-    drop(dest2);
+    overwrite_sidecar(state, project, filename, sidecar_body).await;
+}
+
+/// Overwrite just the sidecar for a cached `(project, filename)` key.
+async fn overwrite_sidecar(state: &AppState, project: &str, filename: &str, sidecar_body: &str) {
+    use tokio::io::AsyncWriteExt;
+    let (staging, mut dest) = state.storage.create_staging_file().await.unwrap();
+    dest.write_all(sidecar_body.as_bytes()).await.unwrap();
+    dest.flush().await.unwrap();
+    drop(dest);
     state
         .storage
         .put_file(
             ".upstream-cache",
             &format!("{project}--{filename}.sha256"),
-            &staging2,
+            &staging,
         )
         .await
         .unwrap();
+}
+
+/// Read a cache sidecar body back as text.
+async fn read_sidecar(state: &AppState, project: &str, filename: &str) -> String {
+    let (_, body) = state
+        .storage
+        .get(".upstream-cache", &format!("{project}--{filename}.sha256"))
+        .await
+        .unwrap()
+        .expect("sidecar must exist");
+    String::from_utf8(body_bytes(body).await).unwrap()
 }
 
 #[tokio::test]
@@ -3131,4 +3174,371 @@ async fn quarantine_disabled_without_policy() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(body_bytes(res.into_body()).await, BYTES);
     assert_eq!(fake.file_hits(), 1);
+}
+
+const DAY_SECS: u64 = 86_400;
+
+#[tokio::test]
+async fn upstream_expired_warm_entry_refetches() {
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![cache_fixture()]).await;
+
+    // Cold fill, then age the entry 31 days past the default 30-day TTL.
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, CACHE_BYTES);
+    assert_eq!(fake.file_hits(), 1);
+    let stale = format!(
+        "{}\n{}\n",
+        sha256_hex(CACHE_BYTES),
+        unix_now() - 31 * DAY_SECS
+    );
+    overwrite_sidecar(&state, CACHE_PROJECT, CACHE_FILE, &stale).await;
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, CACHE_BYTES);
+    assert_eq!(fake.file_hits(), 2, "expired entry must re-fetch");
+    assert_eq!(fake.index_hits(), 1, "index stays TTL-cached");
+
+    // The refill re-stamped the sidecar: same hash, now fresh.
+    let sidecar = read_sidecar(&state, CACHE_PROJECT, CACHE_FILE).await;
+    let mut lines = sidecar.lines();
+    assert_eq!(lines.next().unwrap(), sha256_hex(CACHE_BYTES).as_str());
+    let stamped: u64 = lines.next().unwrap().parse().unwrap();
+    assert!(
+        unix_now().saturating_sub(stamped) < 120,
+        "sidecar must carry a fresh stamp"
+    );
+}
+
+#[tokio::test]
+async fn upstream_unexpired_warm_entry_serves_without_upstream() {
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![cache_fixture()]).await;
+    let expected_etag = format!("\"{}\"", sha256_hex(CACHE_BYTES));
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(fake.file_hits(), 1);
+
+    // Age the entry 29 days: inside the 30-day TTL, still warm.
+    let aged_stamp = unix_now() - 29 * DAY_SECS;
+    let aged = format!("{}\n{aged_stamp}\n", sha256_hex(CACHE_BYTES));
+    overwrite_sidecar(&state, CACHE_PROJECT, CACHE_FILE, &aged).await;
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers().get(header::ETAG).unwrap(), &expected_etag);
+    assert_eq!(body_bytes(res.into_body()).await, CACHE_BYTES);
+    assert_eq!(fake.file_hits(), 1, "unexpired warm hit must not fetch");
+    assert_eq!(
+        fake.index_hits(),
+        1,
+        "unexpired warm hit must skip the index"
+    );
+
+    // A warm hit rewrites nothing: the aged stamp survives verbatim.
+    let sidecar = read_sidecar(&state, CACHE_PROJECT, CACHE_FILE).await;
+    assert_eq!(
+        sidecar.lines().nth(1).unwrap().parse::<u64>().unwrap(),
+        aged_stamp
+    );
+}
+
+#[tokio::test]
+async fn upstream_cache_ttl_zero_never_expires() {
+    // Empty upstream: any fetch attempt proves the path leaked.
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream_and_cache_ttl(vec![], 0).await;
+    const PROJECT: &str = "zeropkg";
+    const FILE: &str = "zeropkg-1.0.tar.gz";
+    const BYTES: &[u8] = b"bytes that never expire under TTL 0";
+    // A legacy unstamped sidecar: unknown age, yet still served with TTL 0.
+    seed_warm_cache_with_sidecar(&state, PROJECT, FILE, BYTES, &sha256_hex(BYTES)).await;
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/files/{PROJECT}/{FILE}"),
+            Some(good_auth()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, BYTES);
+    assert_eq!(fake.index_hits(), 0);
+    assert_eq!(fake.file_hits(), 0);
+    // And the legacy body is left untouched (no refresh, no stamp).
+    assert_eq!(read_sidecar(&state, PROJECT, FILE).await, sha256_hex(BYTES));
+}
+
+#[tokio::test]
+async fn upstream_cache_sweep_deletes_expired_and_keeps_fresh() {
+    use python_package_server::reconcile::sweep_upstream_cache;
+    let (_app, state, _tmp, _fake) = test_app_with_file_upstream(vec![]).await;
+    const PROJECT: &str = "sweeppkg";
+    const OLD_FILE: &str = "sweeppkg-old.tar.gz";
+    const NEW_FILE: &str = "sweeppkg-new.tar.gz";
+    const OLD_BYTES: &[u8] = b"stale bytes the sweep reclaims";
+    const NEW_BYTES: &[u8] = b"fresh bytes the sweep keeps";
+    seed_warm_cache_with_sidecar(
+        &state,
+        PROJECT,
+        OLD_FILE,
+        OLD_BYTES,
+        &format!(
+            "{}\n{}\n",
+            sha256_hex(OLD_BYTES),
+            unix_now() - 31 * DAY_SECS
+        ),
+    )
+    .await;
+    seed_warm_cache(&state, PROJECT, NEW_FILE, NEW_BYTES).await;
+
+    assert_eq!(sweep_upstream_cache(&state.db, &state.storage, 30).await, 1);
+
+    assert!(
+        state
+            .storage
+            .stat(PROJECT, OLD_FILE)
+            .await
+            .unwrap()
+            .is_none(),
+        "expired bytes must be evicted"
+    );
+    assert!(
+        state
+            .storage
+            .get(".upstream-cache", &format!("{PROJECT}--{OLD_FILE}.sha256"))
+            .await
+            .unwrap()
+            .is_none(),
+        "expired sidecar must be evicted"
+    );
+    assert!(
+        state
+            .storage
+            .stat(PROJECT, NEW_FILE)
+            .await
+            .unwrap()
+            .is_some(),
+        "fresh bytes must survive"
+    );
+    assert!(
+        state
+            .storage
+            .get(".upstream-cache", &format!("{PROJECT}--{NEW_FILE}.sha256"))
+            .await
+            .unwrap()
+            .is_some(),
+        "fresh sidecar must survive"
+    );
+}
+
+#[tokio::test]
+async fn upstream_cache_sweep_never_deletes_hosted() {
+    use python_package_server::reconcile::sweep_upstream_cache;
+    let (_app, state, _tmp, _fake) = test_app_with_file_upstream(vec![]).await;
+    const PROJECT: &str = "sweephost";
+    const FILE: &str = "sweephost-1.0.tar.gz";
+    const BYTES: &[u8] = b"hosted bytes with a stale sidecar beside them";
+    seed_hosted(&state, PROJECT, "SweepHost", FILE, &sha256_hex(BYTES), None).await;
+    // Cached bytes plus an ancient sidecar under the same key, as a hosted
+    // upload shadowing an older cache entry leaves behind.
+    seed_warm_cache_with_sidecar(
+        &state,
+        PROJECT,
+        FILE,
+        BYTES,
+        &format!("{}\n0\n", sha256_hex(BYTES)),
+    )
+    .await;
+
+    assert_eq!(sweep_upstream_cache(&state.db, &state.storage, 30).await, 0);
+    assert!(
+        state.storage.stat(PROJECT, FILE).await.unwrap().is_some(),
+        "hosted bytes must survive the sweep"
+    );
+    // Bytes byte-identical and the row untouched: the sweep deleted nothing.
+    let (size, body) = state
+        .storage
+        .get(PROJECT, FILE)
+        .await
+        .unwrap()
+        .expect("hosted bytes must survive the sweep");
+    assert_eq!(size, BYTES.len() as u64);
+    assert_eq!(body_bytes(body).await, BYTES);
+    assert!(
+        state.db.get_file(PROJECT, FILE).await.unwrap().is_some(),
+        "hosted row must survive the sweep"
+    );
+    assert!(
+        state
+            .storage
+            .get(".upstream-cache", &format!("{PROJECT}--{FILE}.sha256"))
+            .await
+            .unwrap()
+            .is_some(),
+        "hosted key sidecar must survive the sweep"
+    );
+}
+
+#[tokio::test]
+async fn upstream_legacy_sidecar_refreshes_once() {
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![cache_fixture()]).await;
+
+    // Legacy plain-hash sidecar: unknown age reads as expired under TTL 30.
+    seed_warm_cache_with_sidecar(
+        &state,
+        CACHE_PROJECT,
+        CACHE_FILE,
+        CACHE_BYTES,
+        &sha256_hex(CACHE_BYTES),
+    )
+    .await;
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_bytes(res.into_body()).await, CACHE_BYTES);
+    assert_eq!(fake.file_hits(), 1, "legacy entry must refresh");
+
+    // The refresh stamped the sidecar; the next request is a true warm hit.
+    let sidecar = read_sidecar(&state, CACHE_PROJECT, CACHE_FILE).await;
+    let mut lines = sidecar.lines();
+    assert_eq!(lines.next().unwrap(), sha256_hex(CACHE_BYTES).as_str());
+    let stamped: u64 = lines
+        .next()
+        .expect("refreshed sidecar must carry a stamp")
+        .parse()
+        .unwrap();
+    assert!(unix_now().saturating_sub(stamped) < 120);
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(&cache_url(), Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(fake.file_hits(), 1, "second request must be a warm hit");
+}
+
+#[tokio::test]
+async fn upstream_expired_sidecar_with_hosted_row_serves_hosted() {
+    // Empty upstream: any fetch attempt proves the path leaked.
+    let (_app, state, _tmp, fake) = test_app_with_file_upstream(vec![]).await;
+    const PROJECT: &str = "shadowpkg";
+    const FILE: &str = "shadowpkg-1.0.tar.gz";
+    const BYTES: &[u8] = b"hosted bytes shadowed by a stale sidecar";
+    let sha = sha256_hex(BYTES);
+    seed_hosted(&state, PROJECT, "ShadowPkg", FILE, &sha, None).await;
+    // Hosted bytes plus an ancient sidecar under the same key, as an upload
+    // racing lazy eviction leaves behind.
+    seed_warm_cache_with_sidecar(&state, PROJECT, FILE, BYTES, &format!("{sha}\n0\n")).await;
+
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            &format!("/files/{PROJECT}/{FILE}"),
+            Some(good_auth()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(header::ETAG).unwrap(),
+        &format!("\"{sha}\"")
+    );
+    assert_eq!(body_bytes(res.into_body()).await, BYTES);
+    assert_eq!(fake.index_hits(), 0);
+    assert_eq!(fake.file_hits(), 0);
+
+    // Nothing deleted: row, bytes, and sidecar all intact afterwards.
+    assert!(
+        state.db.get_file(PROJECT, FILE).await.unwrap().is_some(),
+        "hosted row must survive"
+    );
+    let (size, body) = state
+        .storage
+        .get(PROJECT, FILE)
+        .await
+        .unwrap()
+        .expect("hosted bytes must survive");
+    assert_eq!(size, BYTES.len() as u64);
+    assert_eq!(body_bytes(body).await, BYTES);
+    assert!(
+        state
+            .storage
+            .get(".upstream-cache", &format!("{PROJECT}--{FILE}.sha256"))
+            .await
+            .unwrap()
+            .is_some(),
+        "sidecar beside a hosted key must survive"
+    );
+}
+
+#[tokio::test]
+async fn hosted_upload_removes_shadowing_cache_sidecar() {
+    let (app, state, _tmp) = test_app().await;
+    // A stale sidecar shadowing the key about to be hosted, as an older
+    // pull-through cache entry leaves behind.
+    overwrite_sidecar(
+        &state,
+        NORMALIZED,
+        FILENAME,
+        &format!("{}\n0\n", sha256_hex(b"older cached bytes")),
+    )
+    .await;
+
+    let res = app
+        .oneshot(post_upload_request(
+            Some(good_auth()),
+            upload_body(FILE_BYTES, None),
+            BOUNDARY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // The upload published hosted bytes and dropped the orphaned sidecar.
+    let (size, body) = state
+        .storage
+        .get(NORMALIZED, FILENAME)
+        .await
+        .unwrap()
+        .expect("hosted bytes must exist after upload");
+    assert_eq!(size, FILE_BYTES.len() as u64);
+    assert_eq!(body_bytes(body).await, FILE_BYTES);
+    assert!(
+        state
+            .db
+            .get_file(NORMALIZED, FILENAME)
+            .await
+            .unwrap()
+            .is_some(),
+        "hosted row must exist after upload"
+    );
+    assert!(
+        state
+            .storage
+            .get(
+                ".upstream-cache",
+                &format!("{NORMALIZED}--{FILENAME}.sha256")
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "shadowing sidecar must be removed by the upload"
+    );
 }

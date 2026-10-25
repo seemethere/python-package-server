@@ -24,6 +24,7 @@ fn test_settings(endpoint: String, staging_dir: PathBuf) -> Settings {
         max_upload_bytes: 1024 * 1024,
         upstream_url: None,
         upstream_index_ttl_secs: 300,
+        upstream_cache_max_age_days: 30,
         upstream_private_only_projects: std::collections::HashSet::new(),
         policy_file: None,
         policy: python_package_server::config::Policy::default(),
@@ -138,6 +139,17 @@ async fn s3_storage_roundtrip() {
     assert_eq!(served, 5);
     let got = body.collect().await.unwrap().to_bytes();
     assert_eq!(&got[..], &bytes[3..8]);
+
+    // Listing sees the one object under this run-unique project.
+    assert_eq!(
+        storage.list(&project).await.expect("list project"),
+        vec![filename.to_string()]
+    );
+    assert!(storage
+        .list("no-such-project-ci")
+        .await
+        .expect("list missing")
+        .is_empty());
 
     storage.delete(&project, filename).await.expect("delete");
     assert_eq!(storage.stat(&project, filename).await.unwrap(), None);

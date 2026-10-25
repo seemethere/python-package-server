@@ -284,6 +284,53 @@ impl StorageBackend for S3Backend {
         Ok(())
     }
 
+    async fn list(&self, project: &str) -> Result<Vec<String>, StorageError> {
+        if bad_segment(project) {
+            return Err(StorageError::NotFound(project.to_string()));
+        }
+        let prefix = format!("{project}/");
+        let mut names = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix);
+            if let Some(next) = token {
+                req = req.continuation_token(next);
+            }
+            let output = req
+                .send()
+                .await
+                .map_err(|err| StorageError::io("list objects", err))?;
+            for object in output.contents() {
+                let Some(key) = object.key() else { continue };
+                let Some(name) = key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                // Flat namespace: skip the prefix marker itself and any
+                // nested keys a foreign writer may have planted.
+                if name.is_empty() || name.contains('/') {
+                    continue;
+                }
+                names.push(name.to_string());
+            }
+            if output.is_truncated() == Some(true) {
+                token = output.next_continuation_token().map(str::to_string);
+                // A truncated page without a token cannot advance; stop
+                // rather than re-requesting the same page forever.
+                if token.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     async fn health_check(&self) -> Result<(), StorageError> {
         self.client
             .head_bucket()

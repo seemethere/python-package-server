@@ -74,6 +74,10 @@ pub trait StorageBackend: Clone + Send + Sync + 'static {
     ) -> Result<Option<(u64, u64, Body)>, StorageError>;
     async fn stat(&self, project: &str, filename: &str) -> Result<Option<u64>, StorageError>;
     async fn delete(&self, project: &str, filename: &str) -> Result<(), StorageError>;
+    /// List filenames directly under `project` (non-recursive, files only).
+    /// A missing project lists as empty. Used by the upstream-cache sweep
+    /// to enumerate sidecars; callers filter names themselves.
+    async fn list(&self, project: &str) -> Result<Vec<String>, StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
 }
 
@@ -174,6 +178,13 @@ impl Storage {
         match self {
             Self::Filesystem(fs) => fs.delete(project, filename).await,
             Self::S3(s3) => s3.delete(project, filename).await,
+        }
+    }
+
+    pub async fn list(&self, project: &str) -> Result<Vec<String>, StorageError> {
+        match self {
+            Self::Filesystem(fs) => fs.list(project).await,
+            Self::S3(s3) => s3.list(project).await,
         }
     }
 
@@ -375,6 +386,40 @@ impl StorageBackend for FsBackend {
         }
     }
 
+    async fn list(&self, project: &str) -> Result<Vec<String>, StorageError> {
+        if bad_segment(project) {
+            return Err(StorageError::NotFound(project.to_string()));
+        }
+        let mut entries = match fs::read_dir(self.root.join(project)).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(StorageError::io("list project", e)),
+        };
+        let mut names = Vec::new();
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => return Err(StorageError::io("list project", e)),
+            };
+            // Best-effort per entry: only regular files with UTF-8 names
+            // are listable objects; anything else is skipped, never fatal.
+            let is_file = entry
+                .file_type()
+                .await
+                .map(|t| t.is_file())
+                .unwrap_or(false);
+            if !is_file {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     async fn health_check(&self) -> Result<(), StorageError> {
         fs::metadata(&self.root)
             .await
@@ -506,6 +551,42 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn list_returns_sorted_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::filesystem(dir.path().to_path_buf());
+        storage.ensure_dirs().await.unwrap();
+
+        // A missing project lists as empty, not an error.
+        assert!(storage.list("no-such-project").await.unwrap().is_empty());
+
+        for filename in ["b.whl", "a.whl"] {
+            let staged = storage.stage_path().unwrap();
+            tokio::fs::write(&staged, b"x").await.unwrap();
+            storage
+                .put_file("listpkg", filename, &staged)
+                .await
+                .unwrap();
+        }
+        // A subdirectory is not a listable object.
+        tokio::fs::create_dir_all(dir.path().join("listpkg").join("subdir"))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.list("listpkg").await.unwrap(),
+            vec!["a.whl".to_string(), "b.whl".to_string()]
+        );
+        // Other projects are unaffected.
+        assert!(storage.list("other").await.unwrap().is_empty());
+
+        for bad in ["..", "a/b", ""] {
+            assert!(
+                matches!(storage.list(bad).await, Err(StorageError::NotFound(_))),
+                "expected NotFound for {bad:?}"
+            );
+        }
     }
 
     #[tokio::test]
