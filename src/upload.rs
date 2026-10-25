@@ -19,6 +19,7 @@ use crate::{
     auth::AuthenticatedUser,
     db::{DbError, MetadataStore, NewFile},
     error::{internal, AppError},
+    files::{sidecar_filename, SIDECAR_PROJECT},
     packaging::{check_requires_python, normalize_project, parse_filename},
     state::AppState,
 };
@@ -234,6 +235,20 @@ pub async fn legacy_upload(
         let _ = state.db.delete_file(&validated.normalized, &filename).await;
         cleanup(&staging).await;
         return Err(AppError::from(err));
+    }
+    // The hosted bytes now shadow any pull-through cache entry under this
+    // key; drop the orphaned sidecar so the sweep never weighs hosted bytes
+    // for eviction and no stale stamp lingers. Best-effort and idempotent
+    // (a missing sidecar deletes cleanly): a failure here never fails the
+    // upload, and a leftover sidecar is harmless — hosted rows always win.
+    let sidecar = sidecar_filename(&validated.normalized, &filename);
+    if let Err(err) = state.storage.delete(SIDECAR_PROJECT, &sidecar).await {
+        tracing::warn!(
+            project = validated.normalized.as_str(),
+            filename = filename.as_str(),
+            error = %err,
+            "hosted upload published but shadowing cache sidecar removal failed"
+        );
     }
 
     metrics::counter!("uploads_total").increment(1);

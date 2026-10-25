@@ -33,6 +33,10 @@ pub struct Settings {
     pub upstream_url: Option<String>,
     /// TTL in seconds for cached upstream project index responses.
     pub upstream_index_ttl_secs: u64,
+    /// Max age in days for pull-through cached file bytes; entries older
+    /// than this are re-fetched on demand and swept in the background.
+    /// `0` disables age expiry (cached bytes never expire).
+    pub upstream_cache_max_age_days: u32,
     /// Normalized project names that must never be fetched from upstream.
     pub upstream_private_only_projects: HashSet<String>,
     /// Path to the JSON policy file (`POLICY_FILE`); `None` disables
@@ -154,6 +158,7 @@ impl Settings {
         let max_upload_bytes = parse_max_upload_bytes(&env_or("MAX_UPLOAD_BYTES", "1073741824"))?;
         let upstream_url = parse_upstream_url()?;
         let upstream_index_ttl_secs = parse_upstream_index_ttl_secs()?;
+        let upstream_cache_max_age_days = parse_upstream_cache_max_age_days()?;
         let upstream_private_only_projects = parse_upstream_private_only_projects()?;
         let policy_file = parse_policy_file();
         let policy = match &policy_file {
@@ -172,6 +177,7 @@ impl Settings {
             max_upload_bytes,
             upstream_url,
             upstream_index_ttl_secs,
+            upstream_cache_max_age_days,
             upstream_private_only_projects,
             policy_file,
             policy,
@@ -245,6 +251,20 @@ fn parse_upstream_index_ttl_secs() -> Result<u64, String> {
     }
 }
 
+/// Default 30 days; `0` disables age expiry. Rejects non-numeric and
+/// negative values like the other integer parsers.
+fn parse_upstream_cache_max_age_days() -> Result<u32, String> {
+    match env::var("UPSTREAM_CACHE_MAX_AGE_DAYS") {
+        Ok(value) => match value.trim().parse::<u32>() {
+            Ok(n) => Ok(n),
+            Err(_) => {
+                Err("invalid UPSTREAM_CACHE_MAX_AGE_DAYS (want a non-negative integer)".to_string())
+            }
+        },
+        Err(_) => Ok(30),
+    }
+}
+
 fn parse_upstream_private_only_projects() -> Result<HashSet<String>, String> {
     let raw = match env::var("UPSTREAM_PRIVATE_ONLY_PROJECTS") {
         Ok(value) => value,
@@ -305,6 +325,7 @@ mod tests {
         let saved_endpoint = env::var("S3_ENDPOINT_URL").ok();
         let saved_upstream_url = env::var("UPSTREAM_URL").ok();
         let saved_upstream_ttl = env::var("UPSTREAM_INDEX_TTL_SECS").ok();
+        let saved_cache_age = env::var("UPSTREAM_CACHE_MAX_AGE_DAYS").ok();
         let saved_private_only = env::var("UPSTREAM_PRIVATE_ONLY_PROJECTS").ok();
         let saved_policy_file = env::var("POLICY_FILE").ok();
 
@@ -318,6 +339,7 @@ mod tests {
             restore_var("S3_ENDPOINT_URL", saved_endpoint.as_deref());
             restore_var("UPSTREAM_URL", saved_upstream_url.as_deref());
             restore_var("UPSTREAM_INDEX_TTL_SECS", saved_upstream_ttl.as_deref());
+            restore_var("UPSTREAM_CACHE_MAX_AGE_DAYS", saved_cache_age.as_deref());
             restore_var(
                 "UPSTREAM_PRIVATE_ONLY_PROJECTS",
                 saved_private_only.as_deref(),
@@ -328,6 +350,7 @@ mod tests {
         // Valid baseline: upstream disabled by default.
         env::remove_var("UPSTREAM_URL");
         env::remove_var("UPSTREAM_INDEX_TTL_SECS");
+        env::remove_var("UPSTREAM_CACHE_MAX_AGE_DAYS");
         env::remove_var("UPSTREAM_PRIVATE_ONLY_PROJECTS");
         env::remove_var("POLICY_FILE");
         env::remove_var("STORAGE_BACKEND");
@@ -340,6 +363,7 @@ mod tests {
         let settings = Settings::from_env().unwrap();
         assert_eq!(settings.upstream_url, None);
         assert_eq!(settings.upstream_index_ttl_secs, 300);
+        assert_eq!(settings.upstream_cache_max_age_days, 30);
         assert!(settings.upstream_private_only_projects.is_empty());
         assert_eq!(settings.policy_file, None);
         assert_eq!(settings.policy.quarantine_days_for("anything"), 0);
@@ -446,6 +470,18 @@ mod tests {
             assert!(err.contains("UPSTREAM_INDEX_TTL_SECS"), "{bad}: {err}");
         }
         env::remove_var("UPSTREAM_INDEX_TTL_SECS");
+
+        // Cache max age: default 30, 0 disables expiry, invalid rejected.
+        env::set_var("UPSTREAM_CACHE_MAX_AGE_DAYS", "7");
+        assert_eq!(Settings::from_env().unwrap().upstream_cache_max_age_days, 7);
+        env::set_var("UPSTREAM_CACHE_MAX_AGE_DAYS", "0");
+        assert_eq!(Settings::from_env().unwrap().upstream_cache_max_age_days, 0);
+        for bad in ["-1", "abc", "", "3.5"] {
+            env::set_var("UPSTREAM_CACHE_MAX_AGE_DAYS", bad);
+            let err = Settings::from_env().unwrap_err();
+            assert!(err.contains("UPSTREAM_CACHE_MAX_AGE_DAYS"), "{bad}: {err}");
+        }
+        env::remove_var("UPSTREAM_CACHE_MAX_AGE_DAYS");
 
         // Private-only list: normalized, deduped, invalid fails startup.
         env::set_var(

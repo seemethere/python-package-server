@@ -109,6 +109,7 @@ All configuration is via environment variables:
 | `RUST_LOG`        | No       | `info`         | Log filter, e.g. `info`, `debug`, `warn`.                |
 | `UPSTREAM_URL`    | No       | —              | Upstream simple index base, e.g. `https://pypi.org/simple/`; unset disables pull-through. |
 | `UPSTREAM_INDEX_TTL_SECS` | No | `300`         | TTL for cached upstream project index responses.         |
+| `UPSTREAM_CACHE_MAX_AGE_DAYS` | No | `30`   | Max age in days for cached upstream file bytes; `0` never expires. |
 | `UPSTREAM_PRIVATE_ONLY_PROJECTS` | No | —       | Comma-separated denylist of projects that never fetch upstream. |
 | `POLICY_FILE`   | No       | —              | Path to the JSON quarantine policy file; unset disables quarantine. |
 
@@ -135,9 +136,22 @@ are sha256-verified against the index hash before caching, and cached
 bytes keep serving while upstream is down (the merged index itself
 returns `502` once its short cache expires). Index fetches time out
 after 10s; file downloads after 600s. File URLs from the upstream index
-are fetched server-side, so `UPSTREAM_URL` must be trusted. v1 has no
-cache eviction: cached bytes persist until overwritten by a hosted
-upload (no API clears the pull-through cache).
+are fetched server-side, so `UPSTREAM_URL` must be trusted.
+
+Cached file bytes expire by age (`UPSTREAM_CACHE_MAX_AGE_DAYS`, default
+30 days; `0` disables expiry), superseding the old v1 "no eviction"
+behavior for age expiry (there is still no API to clear the cache).
+Each cached entry records its fetch time in its `.upstream-cache`
+sidecar. Expiry works two ways: lazily, a download whose entry is older
+than the TTL re-fetches, re-verifies, and re-caches with a fresh stamp
+(unexpired warm hits still serve with zero upstream I/O); and by sweep,
+which deletes expired bytes + sidecars to reclaim disk — once at startup
+and then every 6 hours in the background. Hosted files (anything with a
+database row) are never evicted, even if a stale sidecar exists for the
+same key. Sidecars written before timestamps existed carry no fetch time
+and count as expired while a TTL applies, so they refresh once and gain
+a stamp. Every eviction counts the `upstream_cache_evictions_total`
+counter, labelled `source="lazy"` or `source="sweep"`.
 
 ### Upstream quarantine
 
