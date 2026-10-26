@@ -1,25 +1,46 @@
 # syntax=docker/dockerfile:1
 
-# Builder: compile the release binary.
-FROM rust:1-bookworm AS builder
+# Chef base: official rust toolchain + pinned cargo-chef. Every Rust stage
+# below inherits from here so the toolchain and chef versions stay in sync.
+# (Chose `cargo install` over the lukemathwalker/cargo-chef image to keep
+# the exact same rust:1-bookworm base and pin chef by version; tradeoff is
+# one ~1-2 min chef compile on cold builds, cached as a layer afterwards.)
+FROM rust:1-bookworm AS chef
 WORKDIR /app
+# Pinned for reproducibility (--locked uses cargo-chef's own lockfile).
+RUN cargo install cargo-chef --version 0.1.78 --locked
 
-# Copy manifests first for better layer caching, then source + migrations.
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY migrations ./migrations
+# Planner: compute the dependency recipe from the manifests. This step
+# re-runs on any file change but takes seconds; downstream stages only
+# rebuild when recipe.json itself changes (manifest edits).
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Cargo.lock is committed, pinning the full dependency tree; --locked fails
-# the build rather than silently resolving different versions.
-# BuildKit cache mounts keep the registry/git checkouts and incremental
-# target dir warm across builds. The target dir is a cache mount, so its
-# contents are NOT in the final builder layer: copy the binary out to a
-# non-mounted path in the same RUN.
-RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=cargo-target,target=/app/target \
-    cargo build --release --locked && \
-    cp /app/target/release/python-package-server /app/python-package-server
+# Cacher: compile all third-party dependencies into image layers. Warm CI
+# builds restore these layers from the GHA cache (mode=max), skipping the
+# dependency compile entirely.
+FROM chef AS cacher
+COPY --from=planner /app/recipe.json recipe.json
+# Cargo.lock pins the exact tree chef cooks, and a lockfile-only change
+# (e.g. `cargo update`) still invalidates this layer, so the cooked deps
+# always match the final `cargo build --locked` resolution.
+COPY Cargo.lock ./
+RUN cargo chef cook --release --locked --recipe-path recipe.json
+
+# Builder: reuse the cooked dependency artifacts, then compile only the
+# workspace crates. Needs the real source AND ./migrations at compile
+# time (sqlx::migrate! embeds them).
+#
+# NOTE: no BuildKit cache mounts here on purpose. Cooked deps live in
+# layers (restored via the GHA cache), and a target-dir mount would shadow
+# the copied /app/target artifacts while adding GHA export/import
+# overhead — the mounts were the old bottleneck, layers replace them.
+FROM chef AS builder
+COPY --from=cacher /app/target target
+COPY --from=cacher /usr/local/cargo /usr/local/cargo
+COPY . .
+RUN cargo build --release --locked
 
 # Runtime: minimal Debian. The binary uses rustls (see sqlx
 # runtime-tokio-rustls), so no OpenSSL/libssl install is needed here.
@@ -28,7 +49,7 @@ FROM debian:bookworm-slim
 RUN useradd --uid 10000 -m appuser \
     && mkdir -p /data && chown appuser:appuser /data
 
-COPY --from=builder /app/python-package-server /usr/local/bin/python-package-server
+COPY --from=builder /app/target/release/python-package-server /usr/local/bin/python-package-server
 
 USER 10000
 EXPOSE 8000
