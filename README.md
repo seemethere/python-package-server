@@ -186,8 +186,10 @@ warm bytes (outage tradeoff: quarantine needs fresh age metadata).
 
 The file is read once at startup: a missing, unreadable, or malformed
 file (unknown keys, negative/non-integer days, invalid project names)
-fails startup, and policy changes need a restart (in Kubernetes, update
-the `package-server-policy` ConfigMap and roll the deployment). Filtered
+fails startup, and policy changes need a restart to take effect. In
+Kubernetes, edit `k8s/base/policy.json` and re-apply: the generated
+ConfigMap name carries a content hash, so the Deployment rolls
+automatically — no manual `rollout restart` needed. Filtered
 files count in the `upstream_quarantine_filtered_total` counter, labelled
 by `stage` (`index` or `download`).
 
