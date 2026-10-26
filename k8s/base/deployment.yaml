@@ -47,9 +47,10 @@ spec:
             # add an UPSTREAM_URL entry, e.g.:
             # - name: UPSTREAM_URL
             #   value: https://pypi.org/simple/
-            # Upstream quarantine policy (read once at startup; the example
+            # Upstream quarantine policy (read once at startup; the generated
             # ConfigMap ships with a 0-day default, i.e. quarantine off).
-            # Policy edits need a rollout restart (see policy-configmap.yaml).
+            # Policy edits roll automatically via the hashed ConfigMap name
+            # (see kustomization.yaml) — no manual rollout restart needed.
             - name: POLICY_FILE
               value: /config/policy.json
           volumeMounts:

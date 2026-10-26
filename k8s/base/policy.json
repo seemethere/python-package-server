@@ -1,0 +1,4 @@
+{
+  "default": { "upstream_quarantine_days": 0 },
+  "packages": {}
+}

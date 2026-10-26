@@ -4,4 +4,23 @@ resources:
   - deployment.yaml
   - service.yaml
   - storage-pvc.yaml
-  - policy-configmap.yaml
+
+# Default upstream-quarantine policy (quarantine off), mounted at
+# /config/policy.json and read once at startup via POLICY_FILE (see the base
+# deployment). The shipped default is behavior-preserving; add per-package
+# overrides to policy.json to enable quarantine.
+#
+# Shape: {"default": {"upstream_quarantine_days": N}, "packages":
+# {"<project>": {"upstream_quarantine_days": N}}}. 0 disables quarantine for
+# that scope; hosted files are never quarantined.
+#
+# Edits roll automatically: the generated ConfigMap name carries a content
+# hash, so editing policy.json renames the volume reference in the pod
+# template and triggers a Deployment rollout — no manual
+# `rollout restart` needed. (The subPath mount still pins each running pod
+# to the file contents from its start time, but the rollout replaces the
+# pods, so new pods get the new file.)
+configMapGenerator:
+  - name: package-server-policy
+    files:
+      - policy.json
