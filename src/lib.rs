@@ -5,6 +5,7 @@ pub mod db;
 pub mod error;
 pub mod files;
 pub mod health;
+pub mod oidc;
 pub mod packaging;
 pub mod reconcile;
 pub mod s3;

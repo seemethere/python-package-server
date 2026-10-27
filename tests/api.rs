@@ -39,6 +39,8 @@ fn test_settings(storage_dir: PathBuf) -> Settings {
         upstream_private_only_projects: std::collections::HashSet::new(),
         policy_file: None,
         policy: python_package_server::config::Policy::default(),
+        oidc_issuer_url: None,
+        oidc_audience: None,
     }
 }
 

@@ -942,6 +942,8 @@ mod tests {
             upstream_private_only_projects: std::collections::HashSet::new(),
             policy_file: None,
             policy: Policy::default(),
+            oidc_issuer_url: None,
+            oidc_audience: None,
         };
         let state = AppState {
             db: db.clone(),
