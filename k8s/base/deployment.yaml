@@ -47,6 +47,12 @@ spec:
             # add an UPSTREAM_URL entry, e.g.:
             # - name: UPSTREAM_URL
             #   value: https://pypi.org/simple/
+            # Optional OIDC JWT auth (disabled by default; plain values, not
+            # secrets). To enable, add both entries, e.g.:
+            # - name: OIDC_ISSUER_URL
+            #   value: https://accounts.example.com
+            # - name: OIDC_AUDIENCE
+            #   value: <audience>
             # Upstream quarantine policy (read once at startup; the generated
             # ConfigMap ships with a 0-day default, i.e. quarantine off).
             # Policy edits roll automatically via the hashed ConfigMap name

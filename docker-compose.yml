@@ -27,6 +27,9 @@ services:
       # UPSTREAM_URL: https://pypi.org/simple/
       # Upstream quarantine policy (read once at startup; uncomment to enable):
       # POLICY_FILE: /config/policy.json  # also mount a /config volume with policy.json (see below)
+      # OIDC JWT auth (disabled by default; uncomment to enable):
+      # OIDC_ISSUER_URL: https://accounts.example.com
+      # OIDC_AUDIENCE: <audience>
     volumes:
       - ./data:/data
       - ./dev.tokens:/secrets/tokens:ro
