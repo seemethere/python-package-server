@@ -954,6 +954,7 @@ mod tests {
                 .handle(),
             settings: std::sync::Arc::new(settings),
             upstream: None,
+            oidc: None,
         };
 
         // Expired sidecar, but the hosted row wins: served, never deleted.

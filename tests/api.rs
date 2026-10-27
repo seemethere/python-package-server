@@ -13,6 +13,7 @@ use python_package_server::{
     build_router,
     config::{Policy, Settings},
     db::{MemoryStore, MetadataBackend, MetadataStore, NewFile},
+    oidc::OidcValidator,
     state::AppState,
     storage::Storage,
     upstream::UpstreamClient,
@@ -67,6 +68,7 @@ async fn test_app_with_cap(max_upload_bytes: u64) -> (Router, AppState, tempfile
         metrics,
         settings: Arc::new(settings),
         upstream: None,
+        oidc: None,
     };
     let router = build_router(state.clone());
     (router, state, tmp)
@@ -108,6 +110,7 @@ async fn test_app_with_upstream_policy_and_cache_ttl(
         metrics,
         settings: Arc::new(settings),
         upstream,
+        oidc: None,
     };
     let router = build_router(state.clone());
     (router, state, tmp)
@@ -1052,6 +1055,7 @@ async fn test_app_two_users() -> (Router, AppState, tempfile::TempDir) {
         metrics,
         settings: Arc::new(settings),
         upstream: None,
+        oidc: None,
     };
     let router = build_router(state.clone());
     (router, state, tmp)
@@ -3543,4 +3547,244 @@ async fn hosted_upload_removes_shadowing_cache_sidecar() {
             .is_none(),
         "shadowing sidecar must be removed by the upload"
     );
+}
+
+// --- OIDC integration tests (stack 2) ---
+
+// TEST ONLY: same throwaway RSA-2048 keypair as the src/oidc.rs unit tests
+// (copied line-for-line by script; never use in production). The JWKS `n`
+// below is the base64url modulus of this exact private key; `e` is AQAB.
+const OIDC_TEST_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC8qApOzwBt/nBp\nIQxpoKGN1f4/At9M1IThskb3XP78Kil+pfR+ux4SuDMYc1nE/CcHiN1eG85H55GD\nelT4t2DWomH7aLlFWUMGveMMAgOU+K7cQLDVSG6FiHZxqBB9LjnZXDFFItUew+L+\n/x9SqR5CN7Ps49FoonO3SYo7fh2vJe+YmybRoAdXz1tIraEj7TeqsfLRMyh0TsZy\nmAGOZbZNF2RYhOCEPX5mwihodxBOdNyCx4TEafSmVsPTyJK8pYqp6VbmXpg/gzA1\nxwVKakoYDSycgIA6lm0GL7y3zYFWoCI0z3I/jHpfnZV92UtqTnJz+uUDgkEwYpI4\nBIVcGfSXAgMBAAECggEAUcKX2QjAPGtJZ15hxUNO0Kv9yGwjv2XZAwFi3SBqB3n0\nSsV8fRH2GhHHXyDatlK7TXokyfzN/P6gYzU4ryO2Lb7pLO55YNMrB7hytkkHKWBP\nU/gbSwvdjjSSdHZsUvweKRPZ7IcIixFFBtMlTYsqqHMAoLkpD6pb8QLHjDn/fmB3\nUB7vMlvod21VdQFNJVeL+jN/cRMQnkh9H1Bcmi7rC2oGfkN6pFlgJ8XBZxOYYW5M\nXcc+ZSXyKgM4BFpIw4/XlWSlqXiNSzwgtFyo22d0vi4qkM/PwFcmSPet87w+e4br\nNFcl0Z0idtpHcEJcgpb94Uvkt3vWNvHBBHjlBo9lFQKBgQD/5fX4+xIH4TpoBsqD\nKddEKA6lpy42ld3qB8P5xcYrykHzsMCbNfFt1m0hsvdNBo/xGusWw+FVyrf6hLRO\ntW7WmJp7XMJlUAhrxUBkXJJ2t3XMVWQgWBd5P8RMIjQEg6VIaOUZMabm4Vd3Q+MP\nhKswvYdBiBJvAp49uzQ0SwTMVQKBgQC8uzy3dsKuoi0pyOPzEDYuC33OCj9V7muj\nfuIJrjpEArfb+Vd7LOJ7o+6tv9LltPU7Hlonj0dSKN/NsE/UOoxFDsu2tCMvI2a9\nh+z1hKstUdis12RnWKywZlDXoAWLxS5x/PZrc9sFWEIWJUmDrMAU2v+GVrv0WaKH\n0PL34XBpOwKBgQDyY2NrFH6OwjNtp8kZFn/WCk9db47hm3FZJUPnigNdJTb1Wh4G\npsDp9mrmubtv1WBw07uMk7wUZHGCNUMJLugvEtt5MHLePkHLu0p0Bg+hrcNB6jxu\nOqL5cYJBT0CQahYcEWe4RoS+OwJ7cO1ZnKP/BfdhBj/XsNYsyO74/XotBQKBgB5u\n8vOCqxIOBMpgIqHnU1VJdRfsfxoUQDc1Fq4I8kxVQ+Cs7HZoXn0hijNqY0+3RnQq\nCM+oQw/0l2JLtBO8/TGFmUP0+Fd5le+qI4PTyOad9BqrAP3JRs+LMC4VF8/aFAs9\nh178Z60M9lsr2BbrnG3AgsPe6KAWdCcCgquGJuJRAoGBAL98E8AxwRYhPdiWl2xP\nGTdDMQWtTyqtvh0l1UGxZOy2Xnu7144QO6VK51KBFKPeRnqkuviSZjjlJVydSC+3\njqW6LelF+8bZ4GLF3LixAqbXk7ujmWsebyRJMbLdtdo4MG2QBEsHmE7MJFtomsNp\nqLMq05g6ZbSslJQCNMoVJTXw\n-----END PRIVATE KEY-----\n";
+const OIDC_TEST_N: &str = "vKgKTs8Abf5waSEMaaChjdX-PwLfTNSE4bJG91z-_CopfqX0frseErgzGHNZxPwnB4jdXhvOR-eRg3pU-Ldg1qJh-2i5RVlDBr3jDAIDlPiu3ECw1UhuhYh2cagQfS452VwxRSLVHsPi_v8fUqkeQjez7OPRaKJzt0mKO34dryXvmJsm0aAHV89bSK2hI-03qrHy0TModE7GcpgBjmW2TRdkWITghD1-ZsIoaHcQTnTcgseExGn0plbD08iSvKWKqelW5l6YP4MwNccFSmpKGA0snICAOpZtBi-8t82BVqAiNM9yP4x6X52VfdlLak5yc_rlA4JBMGKSOASFXBn0lw";
+const OIDC_TEST_ISSUER: &str = "https://issuer.example.com";
+const OIDC_TEST_AUDIENCE: &str = "test-audience";
+const OIDC_TEST_KID: &str = "test-key";
+
+fn oidc_test_validator() -> OidcValidator {
+    let jwks = serde_json::json!({
+        "keys": [{
+            "kty": "RSA",
+            "kid": OIDC_TEST_KID,
+            "use": "sig",
+            "alg": "RS256",
+            "n": OIDC_TEST_N,
+            "e": "AQAB",
+        }]
+    })
+    .to_string();
+    OidcValidator::new_with_jwks(OIDC_TEST_ISSUER, OIDC_TEST_AUDIENCE, &jwks).unwrap()
+}
+
+fn oidc_claims(user: &str) -> serde_json::Value {
+    serde_json::json!({
+        "iss": OIDC_TEST_ISSUER,
+        "aud": OIDC_TEST_AUDIENCE,
+        "exp": unix_now() + 3600,
+        "sub": format!("sub-{user}"),
+        "preferred_username": user,
+    })
+}
+
+fn oidc_sign(claims: &serde_json::Value) -> String {
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some(OIDC_TEST_KID.to_string());
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(OIDC_TEST_PRIVATE_PEM.as_bytes()).unwrap();
+    jsonwebtoken::encode(&header, claims, &key).unwrap()
+}
+
+fn oidc_jwt(user: &str) -> String {
+    oidc_sign(&oidc_claims(user))
+}
+
+async fn test_app_with_oidc() -> (Router, AppState, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let settings = test_settings(tmp.path().to_path_buf());
+    let storage = Storage::filesystem(settings.storage_dir.clone());
+    storage.ensure_dirs().await.unwrap();
+    let db = MetadataBackend::Memory(MemoryStore::new());
+    // `eve` holds a JWT-shaped opaque token to pin shape dispatch (OIDC wins).
+    let auth = Auth::from_pairs(vec![
+        ("ci".to_string(), "secret".to_string()),
+        ("eve".to_string(), "a.b.c".to_string()),
+    ]);
+    let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder()
+        .handle();
+    let state = AppState {
+        db,
+        storage,
+        auth,
+        metrics,
+        settings: Arc::new(settings),
+        upstream: None,
+        oidc: Some(oidc_test_validator()),
+    };
+    let router = build_router(state.clone());
+    (router, state, tmp)
+}
+
+#[tokio::test]
+async fn oidc_bearer_jwt_valid_claims_ownership() {
+    let (app, state, _tmp) = test_app_with_oidc().await;
+    let jwt = oidc_jwt("oidc-alice");
+
+    // The JWT authenticates for reads.
+    let res = app
+        .oneshot(get_request("/simple/", Some(bearer_auth(&jwt)), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Upload as the OIDC principal claims the project for it.
+    let body = upload_body_for(VERSION, FILENAME, FILE_BYTES);
+    let res = build_router(state.clone())
+        .oneshot(post_upload_request(Some(bearer_auth(&jwt)), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let project = state
+        .db
+        .get_project(NORMALIZED)
+        .await
+        .unwrap()
+        .expect("project exists after upload");
+    assert_eq!(project.owner.as_deref(), Some("oidc-alice"));
+
+    // The static token user is now a non-owner: 403 on the same project.
+    let body = upload_body_for("1.2.4", "demo-pkg-1.2.4.tar.gz", b"ci-bytes");
+    let res = build_router(state.clone())
+        .oneshot(post_upload_request(Some(good_auth()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn oidc_bearer_jwt_invalid_rejected() {
+    let (_app, state, _tmp) = test_app_with_oidc().await;
+
+    let mut claims = oidc_claims("oidc-alice");
+    claims["exp"] = serde_json::json!(unix_now() - 3600);
+    let expired = oidc_sign(&claims);
+
+    let mut claims = oidc_claims("oidc-alice");
+    claims["aud"] = serde_json::json!("other-audience");
+    let wrong_aud = oidc_sign(&claims);
+
+    let valid = oidc_jwt("oidc-alice");
+    let mut tampered = valid.clone();
+    let last = tampered.pop().unwrap();
+    tampered.push(if last == 'a' { 'b' } else { 'a' });
+    assert_ne!(valid, tampered);
+
+    // "a.b.c" is eve's valid opaque token in this harness: as a Bearer
+    // credential it must still 401 (JWT shape wins, no opaque fallback),
+    // while Basic eve:a.b.c authenticates statically (see below).
+    for (case, token) in [expired, wrong_aud, tampered, "a.b.c".to_string()]
+        .into_iter()
+        .enumerate()
+    {
+        let res = build_router(state.clone())
+            .oneshot(get_request("/simple/", Some(bearer_auth(&token)), None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "case {case}");
+    }
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/",
+            Some(basic_auth("eve", "a.b.c")),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn oidc_bearer_opaque_still_works() {
+    let (app, _state, _tmp) = test_app_with_oidc().await;
+    let res = app
+        .oneshot(get_request("/simple/", Some(bearer_auth("secret")), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn oidc_basic_jwt_password() {
+    let (_app, state, _tmp) = test_app_with_oidc().await;
+    let jwt = oidc_jwt("oidc-alice");
+
+    // Matching Basic user + JWT password authenticates.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/",
+            Some(basic_auth("oidc-alice", &jwt)),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Mismatched Basic user is rejected even with a valid JWT.
+    let res = build_router(state.clone())
+        .oneshot(get_request("/simple/", Some(basic_auth("ci", &jwt)), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // JWT-shaped garbage password fails closed with no further fallback.
+    let res = build_router(state.clone())
+        .oneshot(get_request(
+            "/simple/",
+            Some(basic_auth("oidc-alice", "a.b.c")),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn oidc_transfer_to_unknown_user_allowed() {
+    let (app, state, _tmp) = test_app_with_oidc().await;
+
+    // Seed a project owned by ci.
+    let body = upload_body_for(VERSION, FILENAME, FILE_BYTES);
+    let res = app
+        .oneshot(post_upload_request(Some(good_auth()), body, BOUNDARY))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Transfer to an OIDC-only name (absent from the token file) succeeds.
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            TRANSFER_URI,
+            Some(good_auth()),
+            Some(r#"{"new_owner":"oidc-alice"}"#.to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // The new OIDC owner can administer; the previous owner cannot.
+    let jwt = oidc_jwt("oidc-alice");
+    let res = build_router(state.clone())
+        .oneshot(admin_request(
+            "POST",
+            YANK_URI,
+            Some(bearer_auth(&jwt)),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = build_router(state.clone())
+        .oneshot(admin_request("POST", UNYANK_URI, Some(good_auth()), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }

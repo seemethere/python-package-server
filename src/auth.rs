@@ -7,6 +7,7 @@ use base64::Engine;
 use subtle::ConstantTimeEq;
 
 use crate::error::AppError;
+use crate::oidc::OidcValidator;
 
 /// Credential store: `users` maps user -> token, `tokens` maps token -> user.
 ///
@@ -220,9 +221,30 @@ fn split_scheme(header: &str) -> Option<(&str, &str)> {
 #[derive(Clone)]
 pub struct AuthenticatedUser(pub String);
 
-/// Middleware requiring Basic (`user:token`) or Bearer (`token`) credentials.
+/// Auth state for the protected routes: static tokens plus an optional OIDC validator.
+#[derive(Clone)]
+pub struct AuthContext {
+    pub tokens: Auth,
+    pub oidc: Option<OidcValidator>,
+}
+
+/// True when the credential has JWT shape: exactly three non-empty
+/// dot-separated parts. Shape alone never authenticates; OIDC validation
+/// still runs on every shaped token.
+fn is_jwt_shaped(token: &str) -> bool {
+    let parts: Vec<&str> = token.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|part| !part.is_empty())
+}
+
+/// Middleware requiring Basic (`user:token`) or Bearer (`token`) credentials,
+/// with OIDC JWT validation when a validator is configured.
+///
+/// Basic first checks the static token; on mismatch a JWT-shaped password is
+/// validated as OIDC and must yield the Basic user. JWT-shaped Bearer
+/// credentials validate as OIDC only (no opaque fallback); all other Bearer
+/// tokens take the opaque path as before.
 pub async fn require_auth(
-    axum::extract::State(auth): axum::extract::State<Auth>,
+    axum::extract::State(ctx): axum::extract::State<AuthContext>,
     mut req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, AppError> {
@@ -253,23 +275,48 @@ pub async fn require_auth(
             tracing::warn!("auth rejected: basic credentials missing user separator");
             return Err(AppError::Unauthorized);
         };
-        if !auth.verify_basic(user, pass) {
-            tracing::warn!("auth rejected: unknown user or bad token");
-            return Err(AppError::Unauthorized);
+        if ctx.tokens.verify_basic(user, pass) {
+            user.to_string()
+        } else {
+            // OIDC fallback: the password may be a JWT for this Basic user.
+            let validator = match ctx.oidc.as_ref() {
+                Some(validator) if is_jwt_shaped(pass) => validator,
+                _ => {
+                    tracing::warn!("auth rejected: unknown user or bad token");
+                    return Err(AppError::Unauthorized);
+                }
+            };
+            let principal = validator.validate(pass).await.map_err(|err| {
+                tracing::warn!("auth rejected: OIDC token invalid: {err}");
+                AppError::Unauthorized
+            })?;
+            if principal != user {
+                tracing::warn!("auth rejected: OIDC principal does not match Basic user");
+                return Err(AppError::Unauthorized);
+            }
+            user.to_string()
         }
-        user.to_string()
     } else if scheme.eq_ignore_ascii_case("Bearer") {
         let token = credentials.trim();
         if token.is_empty() {
             tracing::warn!("auth rejected: empty bearer token");
             return Err(AppError::Unauthorized);
         }
-        if !auth.verify_bearer(token) {
-            tracing::warn!("auth rejected: unknown bearer token");
-            return Err(AppError::Unauthorized);
+        if let Some(validator) = ctx.oidc.as_ref().filter(|_| is_jwt_shaped(token)) {
+            // JWT-shaped credentials validate as OIDC only: no opaque fallback on failure.
+            validator.validate(token).await.map_err(|err| {
+                tracing::warn!("auth rejected: OIDC token invalid: {err}");
+                AppError::Unauthorized
+            })?
+        } else {
+            if !ctx.tokens.verify_bearer(token) {
+                tracing::warn!("auth rejected: unknown bearer token");
+                return Err(AppError::Unauthorized);
+            }
+            ctx.tokens
+                .user_for_token(token)
+                .unwrap_or_else(|| "token".to_string())
         }
-        auth.user_for_token(token)
-            .unwrap_or_else(|| "token".to_string())
     } else {
         tracing::warn!("auth rejected: unsupported auth scheme");
         return Err(AppError::Unauthorized);
