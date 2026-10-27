@@ -5,6 +5,7 @@ pub mod db;
 pub mod error;
 pub mod files;
 pub mod health;
+pub mod oidc;
 pub mod packaging;
 pub mod reconcile;
 pub mod s3;
@@ -61,7 +62,7 @@ async fn metrics_middleware(req: Request<Body>, next: Next) -> Response {
 /// Build the full router.
 ///
 /// Public (open): `GET /`, `/health`, `/live`, `/metrics`.
-/// Protected (token auth): `GET /simple/`, `GET /simple/{project}/`,
+/// Protected (token or OIDC JWT auth): `GET /simple/`, `GET /simple/{project}/`,
 /// `GET /files/{project}/{filename}`, `POST /legacy/`, and the
 /// owner-only `/admin/*` routes.
 pub fn build_router(state: state::AppState) -> axum::Router {
@@ -98,7 +99,10 @@ pub fn build_router(state: state::AppState) -> axum::Router {
             post(crate::admin::transfer_project),
         )
         .route_layer(middleware::from_fn_with_state(
-            state.auth.clone(),
+            crate::auth::AuthContext {
+                tokens: state.auth.clone(),
+                oidc: state.oidc.clone(),
+            },
             crate::auth::require_auth,
         ));
 

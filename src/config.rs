@@ -44,6 +44,11 @@ pub struct Settings {
     pub policy_file: Option<PathBuf>,
     /// Policy parsed once at startup from [`Settings::policy_file`].
     pub policy: Policy,
+    /// OIDC issuer base URL (e.g. `https://accounts.example.com`).
+    /// `None` disables OIDC JWT authentication.
+    pub oidc_issuer_url: Option<String>,
+    /// Expected OIDC audience; required when [`Settings::oidc_issuer_url`] is set.
+    pub oidc_audience: Option<String>,
 }
 
 /// Upstream quarantine policy, read once at startup (no hot reload).
@@ -165,6 +170,7 @@ impl Settings {
             Some(path) => Policy::load(path)?,
             None => Policy::default(),
         };
+        let (oidc_issuer_url, oidc_audience) = parse_oidc()?;
         Ok(Self {
             bind_addr: env_or("BIND_ADDR", "0.0.0.0:8000"),
             database_url: required_non_blank("DATABASE_URL")?,
@@ -181,6 +187,8 @@ impl Settings {
             upstream_private_only_projects,
             policy_file,
             policy,
+            oidc_issuer_url,
+            oidc_audience,
         })
     }
 }
@@ -297,6 +305,46 @@ fn parse_policy_file() -> Option<PathBuf> {
     }
 }
 
+fn validate_oidc_issuer_url(value: &str) -> Result<(), String> {
+    validate_http_url(value, "OIDC_ISSUER_URL")
+}
+
+/// `OIDC_ISSUER_URL`: blank or unset disables OIDC; otherwise a trimmed
+/// `http`/`https` URL with a host.
+fn parse_oidc_issuer_url() -> Result<Option<String>, String> {
+    match env::var("OIDC_ISSUER_URL") {
+        Ok(value) if !value.trim().is_empty() => {
+            let value = value.trim().to_string();
+            validate_oidc_issuer_url(&value)?;
+            Ok(Some(value))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `OIDC_AUDIENCE`: blank or unset means no audience; otherwise trimmed.
+/// Required when the issuer is set; forbidden alone (fail fast on typos).
+fn parse_oidc_audience() -> Result<Option<String>, String> {
+    match env::var("OIDC_AUDIENCE") {
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_string())),
+        _ => Ok(None),
+    }
+}
+
+fn parse_oidc() -> Result<(Option<String>, Option<String>), String> {
+    let issuer = parse_oidc_issuer_url()?;
+    let audience = parse_oidc_audience()?;
+    match (&issuer, &audience) {
+        (Some(_), None) => {
+            Err("env var OIDC_AUDIENCE is required when OIDC_ISSUER_URL is set".to_string())
+        }
+        (None, Some(_)) => {
+            Err("env var OIDC_ISSUER_URL is required when OIDC_AUDIENCE is set".to_string())
+        }
+        _ => Ok((issuer, audience)),
+    }
+}
+
 /// Parse the upload cap, rejecting non-numeric, zero, and over-i64 values.
 fn parse_max_upload_bytes(raw: &str) -> Result<u64, String> {
     match raw.parse::<u64>() {
@@ -328,6 +376,8 @@ mod tests {
         let saved_cache_age = env::var("UPSTREAM_CACHE_MAX_AGE_DAYS").ok();
         let saved_private_only = env::var("UPSTREAM_PRIVATE_ONLY_PROJECTS").ok();
         let saved_policy_file = env::var("POLICY_FILE").ok();
+        let saved_oidc_issuer = env::var("OIDC_ISSUER_URL").ok();
+        let saved_oidc_audience = env::var("OIDC_AUDIENCE").ok();
 
         let restore = || {
             restore_var("DATABASE_URL", saved_db.as_deref());
@@ -345,6 +395,8 @@ mod tests {
                 saved_private_only.as_deref(),
             );
             restore_var("POLICY_FILE", saved_policy_file.as_deref());
+            restore_var("OIDC_ISSUER_URL", saved_oidc_issuer.as_deref());
+            restore_var("OIDC_AUDIENCE", saved_oidc_audience.as_deref());
         };
 
         // Valid baseline: upstream disabled by default.
@@ -357,6 +409,8 @@ mod tests {
         env::remove_var("S3_BUCKET");
         env::remove_var("S3_REGION");
         env::remove_var("S3_ENDPOINT_URL");
+        env::remove_var("OIDC_ISSUER_URL");
+        env::remove_var("OIDC_AUDIENCE");
         env::set_var("DATABASE_URL", "postgres://localhost/packages");
         env::set_var("AUTH_TOKEN_FILE", "/tmp/tokens");
         env::set_var("MAX_UPLOAD_BYTES", "1024");
@@ -367,6 +421,8 @@ mod tests {
         assert!(settings.upstream_private_only_projects.is_empty());
         assert_eq!(settings.policy_file, None);
         assert_eq!(settings.policy.quarantine_days_for("anything"), 0);
+        assert_eq!(settings.oidc_issuer_url, None);
+        assert_eq!(settings.oidc_audience, None);
 
         // Zero cap rejected.
         env::set_var("MAX_UPLOAD_BYTES", "0");
@@ -534,6 +590,66 @@ mod tests {
         let err = Settings::from_env().unwrap_err();
         assert!(err.contains("policy file"), "unexpected: {err}");
         env::remove_var("POLICY_FILE");
+
+        // OIDC: unset/blank disables.
+        env::remove_var("OIDC_ISSUER_URL");
+        env::remove_var("OIDC_AUDIENCE");
+        let settings = Settings::from_env().unwrap();
+        assert_eq!(settings.oidc_issuer_url, None);
+        assert_eq!(settings.oidc_audience, None);
+        env::set_var("OIDC_ISSUER_URL", "   ");
+        env::set_var("OIDC_AUDIENCE", "  ");
+        let settings = Settings::from_env().unwrap();
+        assert_eq!(settings.oidc_issuer_url, None);
+        assert_eq!(settings.oidc_audience, None);
+
+        // Valid pair parses (trimmed).
+        env::set_var("OIDC_ISSUER_URL", "  https://accounts.example.com  ");
+        env::set_var("OIDC_AUDIENCE", "  api-audience  ");
+        let settings = Settings::from_env().unwrap();
+        assert_eq!(
+            settings.oidc_issuer_url.as_deref(),
+            Some("https://accounts.example.com")
+        );
+        assert_eq!(settings.oidc_audience.as_deref(), Some("api-audience"));
+
+        // Issuer without audience errors (missing or blank).
+        env::set_var("OIDC_ISSUER_URL", "https://accounts.example.com");
+        env::remove_var("OIDC_AUDIENCE");
+        let err = Settings::from_env().unwrap_err();
+        assert!(err.contains("OIDC_AUDIENCE"), "unexpected: {err}");
+        env::set_var("OIDC_AUDIENCE", "   ");
+        let err = Settings::from_env().unwrap_err();
+        assert!(err.contains("OIDC_AUDIENCE"), "unexpected: {err}");
+
+        // Audience without issuer errors.
+        env::remove_var("OIDC_ISSUER_URL");
+        env::set_var("OIDC_AUDIENCE", "api-audience");
+        let err = Settings::from_env().unwrap_err();
+        assert!(err.contains("OIDC_ISSUER_URL"), "unexpected: {err}");
+        env::set_var("OIDC_ISSUER_URL", "  ");
+        let err = Settings::from_env().unwrap_err();
+        assert!(err.contains("OIDC_ISSUER_URL"), "unexpected: {err}");
+
+        // Blank issuer with audience set is audience-without-issuer.
+        env::set_var("OIDC_ISSUER_URL", "   ");
+        env::set_var("OIDC_AUDIENCE", "api-audience");
+        assert!(Settings::from_env().is_err());
+
+        // Invalid issuer URLs fail fast.
+        env::set_var("OIDC_AUDIENCE", "api-audience");
+        for bad in [
+            "accounts.example.com",
+            "ftp://accounts.example.com",
+            "http://",
+            "http://a b",
+        ] {
+            env::set_var("OIDC_ISSUER_URL", bad);
+            let err = Settings::from_env().unwrap_err();
+            assert!(err.contains("OIDC_ISSUER_URL"), "{bad}: {err}");
+        }
+        env::remove_var("OIDC_ISSUER_URL");
+        env::remove_var("OIDC_AUDIENCE");
 
         restore();
         assert!(Settings::from_env().is_err() || saved_db.is_some());

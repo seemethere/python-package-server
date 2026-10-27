@@ -942,6 +942,8 @@ mod tests {
             upstream_private_only_projects: std::collections::HashSet::new(),
             policy_file: None,
             policy: Policy::default(),
+            oidc_issuer_url: None,
+            oidc_audience: None,
         };
         let state = AppState {
             db: db.clone(),
@@ -952,6 +954,7 @@ mod tests {
                 .handle(),
             settings: std::sync::Arc::new(settings),
             upstream: None,
+            oidc: None,
         };
 
         // Expired sidecar, but the hosted row wins: served, never deleted.

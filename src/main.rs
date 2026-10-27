@@ -84,6 +84,14 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let oidc = match python_package_server::oidc::OidcValidator::from_settings(&settings).await {
+        Ok(oidc) => oidc,
+        Err(err) => {
+            eprintln!("oidc initialization failed: {err}");
+            std::process::exit(1);
+        }
+    };
+
     reconcile(&db, &storage).await;
 
     // Install before serving so request-time counters register.
@@ -123,6 +131,7 @@ async fn main() {
         db,
         storage,
         auth,
+        oidc,
         metrics,
         settings: Arc::clone(&settings),
         upstream,
