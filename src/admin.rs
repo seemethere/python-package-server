@@ -230,12 +230,17 @@ pub async fn transfer_project(
     if new_owner.is_empty() {
         return Err(AppError::BadRequest("missing new_owner".to_string()));
     }
+    if new_owner.chars().any(|c| c.is_control()) {
+        return Err(AppError::BadRequest("invalid new_owner".to_string()));
+    }
     if record.owner.as_deref() == Some(new_owner) {
         return Err(AppError::BadRequest(format!(
             "project {normalized} is already owned by '{new_owner}'"
         )));
     }
-    if !state.auth.has_user(new_owner) {
+    // When OIDC is enabled the IdP is the user directory, so any non-empty
+    // name is accepted and spelling is the operator's responsibility.
+    if !state.auth.has_user(new_owner) && state.oidc.is_none() {
         return Err(AppError::BadRequest(format!("unknown user '{new_owner}'")));
     }
     if !state.db.set_project_owner(&normalized, new_owner).await? {

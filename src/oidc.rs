@@ -1,9 +1,9 @@
 //! OIDC Bearer JWT validation via issuer discovery and JWKS.
 //!
-//! Stack 1: validator + config only, no middleware wiring. The validator
-//! fetches `/.well-known/openid-configuration` once at construction, then
-//! the JWKS, failing fast at startup like S3/Policy. Tokens are validated
-//! offline against the cached JWKS (RS256/RS384/RS512/ES256/ES384 only).
+//! The validator fetches `/.well-known/openid-configuration` once at
+//! construction, then the JWKS, failing fast at startup like S3/Policy.
+//! Tokens are validated offline against the cached JWKS
+//! (RS256/RS384/RS512/ES256/ES384 only) by the auth middleware.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +21,9 @@ const JWKS_MAX_AGE_SECS: u64 = 300;
 
 /// Clock-skew leeway for `exp`/`nbf` checks.
 const LEEWAY_SECS: u64 = 60;
+
+/// Max accepted principal length, in characters.
+const MAX_PRINCIPAL_CHARS: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum OidcError {
@@ -44,6 +47,8 @@ pub enum OidcError {
     Validation(String),
     #[error("oidc principal missing (no preferred_username, email, or sub)")]
     MissingPrincipal,
+    #[error("oidc misconfigured: {0}")]
+    Config(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,14 +178,41 @@ fn principal_from_claims(claims: &Claims) -> Result<String, OidcError> {
     .flatten()
     {
         let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+        if trimmed.is_empty() {
+            continue;
         }
+        // The first non-empty candidate wins; an overlong or
+        // control-character principal fails closed rather than falling
+        // through to a different identity.
+        if trimmed.chars().count() > MAX_PRINCIPAL_CHARS || trimmed.chars().any(|c| c.is_control())
+        {
+            return Err(OidcError::MissingPrincipal);
+        }
+        return Ok(trimmed.to_string());
     }
     Err(OidcError::MissingPrincipal)
 }
 
 impl OidcValidator {
+    /// Build a validator from settings: `None` when OIDC is disabled
+    /// (issuer unset), otherwise discover the issuer and fetch JWKS once.
+    /// A missing audience with an issuer set is a defensive config error
+    /// (the config parser already rejects it, so this is unreachable via
+    /// `Settings::from_env`).
+    pub async fn from_settings(
+        settings: &crate::config::Settings,
+    ) -> Result<Option<Self>, OidcError> {
+        let Some(issuer) = settings.oidc_issuer_url.as_deref() else {
+            return Ok(None);
+        };
+        let Some(audience) = settings.oidc_audience.as_deref() else {
+            return Err(OidcError::Config(
+                "OIDC_AUDIENCE is required when OIDC_ISSUER_URL is set".to_string(),
+            ));
+        };
+        Self::new(issuer, audience).await.map(Some)
+    }
+
     /// Discover the issuer and fetch JWKS once, failing fast at startup.
     pub async fn new(issuer: &str, audience: &str) -> Result<Self, OidcError> {
         let issuer = issuer.trim_end_matches('/');
@@ -447,6 +479,33 @@ mod tests {
             validator.validate(&token).await.unwrap_err(),
             OidcError::MissingPrincipal
         ));
+    }
+
+    #[tokio::test]
+    async fn rejects_control_char_and_overlong_principal() {
+        let validator = test_validator();
+        let overlong = "x".repeat(257);
+        for bad in ["ali\nce", "bob\0", "carol\x7f", overlong.as_str()] {
+            let claims = TestClaims {
+                preferred_username: Some(bad.to_string()),
+                ..base_claims()
+            };
+            let token = encode_rs256(&claims, Some(TEST_KID));
+            assert!(
+                matches!(
+                    validator.validate(&token).await.unwrap_err(),
+                    OidcError::MissingPrincipal
+                ),
+                "accepted principal {bad:?}"
+            );
+        }
+        // Exactly at the cap is accepted.
+        let claims = TestClaims {
+            preferred_username: Some("y".repeat(256)),
+            ..base_claims()
+        };
+        let token = encode_rs256(&claims, Some(TEST_KID));
+        assert_eq!(validator.validate(&token).await.unwrap(), "y".repeat(256));
     }
 
     #[tokio::test]

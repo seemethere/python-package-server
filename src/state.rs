@@ -6,6 +6,7 @@ pub struct AppState {
     pub db: crate::db::MetadataBackend,
     pub storage: crate::storage::Storage,
     pub auth: crate::auth::Auth,
+    pub oidc: Option<crate::oidc::OidcValidator>,
     pub metrics: metrics_exporter_prometheus::PrometheusHandle,
     pub settings: std::sync::Arc<crate::config::Settings>,
     pub upstream: Option<crate::upstream::UpstreamClient>,
