@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: package-server
+spec:
+  # The S3 overlay runs 2+ replicas, so one pod can always be evicted
+  # for node drains/upgrades without taking the API offline.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: package-server

@@ -363,6 +363,8 @@ Notes:
   bucket name in the overlay first (see its comments).
 - Probes: startup/readiness use deep `GET /health`; liveness uses shallow
   `GET /live` so a database outage marks the pod unready without restarting it.
+- Storage choice (S3 is the production default; base filesystem is
+  single-node only): see [k8s/STORAGE.md](./k8s/STORAGE.md).
 
 ## Project layout
 
