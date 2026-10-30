@@ -6,6 +6,20 @@ on:
   pull_request:
 
 jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Pinned secret scanner; fails the run on any committed secret.
+      # Only the documented dev-only placeholder is allowlisted
+      # (see .gitleaks.toml) — never extend it with real values.
+      - uses: gitleaks/gitleaks-action@v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20

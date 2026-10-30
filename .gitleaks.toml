@@ -1,0 +1,26 @@
+# Gitleaks config for python-package-server.
+#
+# Intent: fail CI on any committed real secret, while allowlisting exactly
+# one documented dev-only placeholder: `dev-local-token-change-me`
+# (dev.tokens + README/docker-compose examples). Never extend this
+# allowlist with real-looking values — see docs/prod-secrets.md.
+title = "python-package-server"
+
+# CRITICAL: without this [extend] block, a custom config REPLACES the default
+# rules and the scan becomes a no-op. Keep it so all default rules stay active.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "documented non-secrets: dev-only placeholder token + test-only key"
+paths = [
+  '''dev\.tokens''',
+]
+regexes = [
+  '''dev-local-token-change-me''',
+  # TEST ONLY throwaway RSA-2048 keypair shared by src/oidc.rs unit tests and
+  # tests/api.rs OIDC tests (offline JWT signing; never production). This
+  # regex matches the key's unique base64 prefix, so ONLY this exact
+  # throwaway key is suppressed — any other private key still fails the scan.
+  '''MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC8qApOzwBt''',
+]

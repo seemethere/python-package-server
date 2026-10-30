@@ -216,7 +216,8 @@ ci:7c9e6679-7425-40de-944b-e07fc1f90ae7
 
 Rotation: edit the file (or replace the mounted secret) — new tokens take
 effect on the next request; no restart needed. Revoking a token is the same:
-remove its line.
+remove its line. Production token generation, rotation, and secret hygiene:
+[docs/prod-secrets.md](./docs/prod-secrets.md).
 
 Project ownership: the first user to upload a project owns it, and only
 that user may publish further files to it (`403` for everyone else).
