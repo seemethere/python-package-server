@@ -3,3 +3,9 @@
 data/
 *.swp
 .DS_Store
+# Generated production token files (scripts/generate-tokens.sh) — never commit.
+# The dev-only placeholder (dev.tokens) is tracked on purpose; everything
+# real stays out-of-band. See docs/prod-secrets.md.
+prod.tokens
+tokens
+*.tokens.generated

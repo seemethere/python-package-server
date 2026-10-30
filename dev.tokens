@@ -1,4 +1,8 @@
-# DEV ONLY — never use in production.
+# DEV ONLY — never use in production. This file is a documented placeholder
+# allowlisted by the gitleaks scanner (see .gitleaks.toml); real tokens must
+# NEVER be committed here. For production, see docs/prod-secrets.md.
+# NOTE: this placeholder must stay low-entropy and documented; the scanner
+# allowlist covers exactly this string, nothing else.
 # Format: one `user:token` per line. `#` comments and blank lines are ignored.
 # Rotate/replace this token for any shared or production-like environment.
 dev:dev-local-token-change-me
