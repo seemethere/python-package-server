@@ -4,6 +4,7 @@ resources:
   - deployment.yaml
   - service.yaml
   - storage-pvc.yaml
+  - postgres-backup-cronjob.yaml
 
 # Default upstream-quarantine policy (quarantine off), mounted at
 # /config/policy.json and read once at startup via POLICY_FILE (see the base

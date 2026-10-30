@@ -1,0 +1,177 @@
+# Nightly Postgres backup: pg_dump -> gzip -> S3.
+#
+# Design: an initContainer dumps the database with pg_dump (Bitnami-free,
+# stock postgres image) into a shared emptyDir; the main container uploads
+# the file to S3 with the AWS CLI. Two stock pinned images, no runtime
+# package installs, no custom backup image to build and republish.
+#
+# Setup (required before unsuspending):
+#  1. Create/choose the backup bucket and keep dumps under a prefix, e.g.
+#     `postgres/` (see BACKUP_S3_BUCKET / BACKUP_S3_PREFIX below).
+#  2. Apply the companion lifecycle rules
+#     (k8s/overlays/s3/bucket-lifecycle.example.json) so old dumps expire.
+#  3. Provide AWS credentials via your platform's IAM role for service
+#     accounts (preferred), or add AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+#     keys to the `package-server-secrets` Secret (read as optional keys).
+#  4. Unsuspend: kubectl -n packages patch cronjob
+#     package-server-postgres-backup -p '{"spec":{"suspend":false}}'
+#
+# Full schedule/retention/restore notes: docs/backup-restore.md.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: package-server-postgres-backup
+  labels:
+    app: package-server
+    component: postgres-backup
+spec:
+  # Daily at 03:00 UTC. Tune to a low-traffic window for the deployment.
+  schedule: "0 3 * * *"
+  timeZone: "UTC"
+  # Ships suspended: there is no valid bucket until an operator configures
+  # one (see above). Unsuspend after setup so a default install never
+  # schedules jobs that are guaranteed to fail.
+  suspend: true
+  # Never overlap runs: a slow dump must delay, not duplicate, the next one.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app: package-server
+            component: postgres-backup
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            fsGroup: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+            - name: pg-dump
+              # Pinned: major.minor + alpine point release. Stay on the same
+              # Postgres major as the server (CI uses postgres:16-alpine).
+              image: postgres:16.4-alpine3.20
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -euo pipefail
+                  TS=$(date -u +%Y%m%dT%H%M%SZ)
+                  OUT=/backups/pgdump-"$TS".sql.gz
+                  # Plain SQL (restores with gunzip | psql); --no-owner /
+                  # --no-privileges keep the dump replayable against a fresh
+                  # role. DATABASE_URL is never echoed (no `set -x`).
+                  pg_dump --no-owner --no-privileges --format=plain "$DATABASE_URL" \
+                    | gzip -9 > "$OUT"
+                  test -s "$OUT"
+                  ls -lh "$OUT"
+                  echo "dump complete: $OUT"
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: package-server-secrets
+                      key: DATABASE_URL
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 1000m
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+          containers:
+            - name: s3-upload
+              # Pinned AWS CLI v2. Check Docker Hub for newer 2.x patches
+              # when refreshing; any 2.x supports the flags used below.
+              image: amazon/aws-cli:2.17.35
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -euo pipefail
+                  ENDPOINT_ARGS=""
+                  if [ -n "${S3_ENDPOINT_URL:-}" ]; then
+                    ENDPOINT_ARGS="--endpoint-url $S3_ENDPOINT_URL"
+                  fi
+                  FILE=$(ls /backups/pgdump-*.sql.gz)
+                  test -f "$FILE"
+                  KEY="$BACKUP_S3_PREFIX/$(basename "$FILE")"
+                  # shellcheck disable=SC2086
+                  aws $ENDPOINT_ARGS s3 cp "$FILE" \
+                    "s3://$BACKUP_S3_BUCKET/$KEY" --only-show-errors
+                  # Verify the object landed before the job reports success.
+                  # shellcheck disable=SC2086
+                  aws $ENDPOINT_ARGS s3 ls \
+                    "s3://$BACKUP_S3_BUCKET/$KEY"
+                  echo "uploaded s3://$BACKUP_S3_BUCKET/$KEY"
+              env:
+                # TODO: replace with the real backup bucket (may equal the
+                # package bucket with a distinct prefix, or a separate one).
+                - name: BACKUP_S3_BUCKET
+                  value: REPLACE-ME-BACKUP-BUCKET
+                - name: BACKUP_S3_PREFIX
+                  value: postgres
+                # Blank by default (real AWS). Set to e.g.
+                # http://minio:9000 for S3-compatible endpoints.
+                - name: S3_ENDPOINT_URL
+                  value: ""
+                - name: AWS_DEFAULT_REGION
+                  value: us-east-1
+                # Writable home for the non-root uid (aws-cli cache/config).
+                - name: HOME
+                  value: /tmp
+                # Optional static credentials; prefer your platform's IAM
+                # role for service accounts and leave these keys unset.
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: package-server-secrets
+                      key: AWS_ACCESS_KEY_ID
+                      optional: true
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: package-server-secrets
+                      key: AWS_SECRET_ACCESS_KEY
+                      optional: true
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                # aws-cli writes cache/config under $HOME; /tmp is writable.
+                readOnlyRootFilesystem: false
+                capabilities:
+                  drop:
+                    - ALL
+          volumes:
+            - name: backups
+              emptyDir: {}

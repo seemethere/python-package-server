@@ -363,6 +363,8 @@ Notes:
   bucket name in the overlay first (see its comments).
 - Probes: startup/readiness use deep `GET /health`; liveness uses shallow
   `GET /live` so a database outage marks the pod unready without restarting it.
+- Backups: nightly Postgres dumps to S3 plus the restore runbook are in
+  [docs/backup-restore.md](./docs/backup-restore.md).
 
 ## Project layout
 
