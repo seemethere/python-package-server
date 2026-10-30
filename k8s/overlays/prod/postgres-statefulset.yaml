@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  # Single replica: no replication/failover. For HA use a managed Postgres
+  # (or an operator) and point DATABASE_URL at it instead — see README.md
+  # in this directory.
+  replicas: 1
+  serviceName: postgres
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      # Let Postgres checkpoint on SIGTERM; kubelet SIGKILLs past the grace period.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          # Matches docker-compose.yml and the CI Postgres service version.
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_USER
+              value: packages
+            - name: POSTGRES_DB
+              value: packages
+            # Data lives in a pgdata subdir so the volume root stays clean.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            # Secret-sourced: no default password anywhere in git. The admin
+            # creates `package-server-secrets` out-of-band with a strong
+            # POSTGRES_PASSWORD (see secret.example.yaml); the app's
+            # DATABASE_URL in the same secret must embed the same password.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: package-server-secrets
+                  key: POSTGRES_PASSWORD
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "packages", "-d", "packages"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "packages", "-d", "packages"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
+        # storageClassName intentionally unset: uses the cluster default
+        # StorageClass (same convention as the base app PVC).

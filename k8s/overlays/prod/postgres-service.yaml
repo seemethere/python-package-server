@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  # Headless: stable per-pod DNS for the StatefulSet; the app reaches the
+  # database at `postgres:5432` (see DATABASE_URL in secret.example.yaml).
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432

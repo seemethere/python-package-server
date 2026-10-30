@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: packages
+resources:
+  - ../../base
+  - postgres-service.yaml
+  - postgres-statefulset.yaml
+  - ingress.yaml
+# No patches: the base Deployment is used as-is, so its probe behaviour is
+# unchanged (startup/readiness on deep GET /health, liveness on shallow
+# GET /live). The app reads DATABASE_URL from the out-of-band
+# `package-server-secrets` Secret, which the admin points at the in-cluster
+# Postgres service (postgres:5432) — see secret.example.yaml.
