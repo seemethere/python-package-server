@@ -33,6 +33,9 @@ use crate::{
 /// Maximum accepted yank-reason length, in characters.
 const MAX_REASON_CHARS: usize = 512;
 
+/// Max transfer-target length; matches the OIDC principal cap so the new owner can always authenticate.
+const MAX_OWNER_CHARS: usize = 256;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct YankRequest {
@@ -114,6 +117,23 @@ fn clean_reason(request: Option<YankRequest>) -> Result<Option<String>, AppError
         )));
     }
     Ok(Some(trimmed.to_string()))
+}
+
+/// Normalize a transfer target: trimmed, non-empty, no control chars, capped.
+fn clean_new_owner(raw: &str) -> Result<String, AppError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest("missing new_owner".to_string()));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(AppError::BadRequest("invalid new_owner".to_string()));
+    }
+    if trimmed.chars().count() > MAX_OWNER_CHARS {
+        return Err(AppError::BadRequest(format!(
+            "new_owner exceeds {MAX_OWNER_CHARS} characters"
+        )));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Yank one file (`POST .../yank`), optionally with `{"reason": "..."}`.
@@ -226,24 +246,18 @@ pub async fn transfer_project(
 ) -> Result<Response, AppError> {
     let (normalized, record) = administered_project(&state, &project, &user.0).await?;
     let request: TransferRequest = parse_json(&body)?;
-    let new_owner = request.new_owner.trim();
-    if new_owner.is_empty() {
-        return Err(AppError::BadRequest("missing new_owner".to_string()));
-    }
-    if new_owner.chars().any(|c| c.is_control()) {
-        return Err(AppError::BadRequest("invalid new_owner".to_string()));
-    }
-    if record.owner.as_deref() == Some(new_owner) {
+    let new_owner = clean_new_owner(&request.new_owner)?;
+    if record.owner.as_deref() == Some(new_owner.as_str()) {
         return Err(AppError::BadRequest(format!(
             "project {normalized} is already owned by '{new_owner}'"
         )));
     }
     // When OIDC is enabled the IdP is the user directory, so any non-empty
     // name is accepted and spelling is the operator's responsibility.
-    if !state.auth.has_user(new_owner) && state.oidc.is_none() {
+    if !state.auth.has_user(&new_owner) && state.oidc.is_none() {
         return Err(AppError::BadRequest(format!("unknown user '{new_owner}'")));
     }
-    if !state.db.set_project_owner(&normalized, new_owner).await? {
+    if !state.db.set_project_owner(&normalized, &new_owner).await? {
         return Err(AppError::NotFound(format!(
             "project {normalized} not found"
         )));
@@ -286,5 +300,34 @@ mod tests {
         ));
         let at_cap = "x".repeat(MAX_REASON_CHARS);
         assert!(clean_reason(request(Some(at_cap.as_str()))).is_ok());
+    }
+
+    #[test]
+    fn cleans_new_owners() {
+        assert_eq!(clean_new_owner("  alice  ").unwrap(), "alice".to_string());
+        assert!(matches!(clean_new_owner(""), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            clean_new_owner("   "),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            clean_new_owner("ali\nce"),
+            Err(AppError::BadRequest(_))
+        ));
+        let too_long = "x".repeat(257);
+        assert!(matches!(
+            clean_new_owner(too_long.as_str()),
+            Err(AppError::BadRequest(_))
+        ));
+        // Hardcoded 256 pins parity with the OIDC principal cap.
+        let at_cap = "x".repeat(256);
+        assert_eq!(clean_new_owner(at_cap.as_str()).unwrap(), at_cap);
+        // Multibyte chars count once each (chars, not bytes).
+        let wide = "é".repeat(256);
+        assert_eq!(clean_new_owner(wide.as_str()).unwrap(), wide);
+        assert!(matches!(
+            clean_new_owner("é".repeat(257).as_str()),
+            Err(AppError::BadRequest(_))
+        ));
     }
 }
