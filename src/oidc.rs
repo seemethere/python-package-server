@@ -16,8 +16,15 @@ const HTTP_TIMEOUT_SECS: u64 = 10;
 
 /// Max JWKS cache age before a proactive refresh. Stale caches refresh on
 /// the next validation; fresh caches with an unknown `kid` still force one
-/// refresh to handle key rotation.
+/// refresh to handle key rotation, throttled by
+/// `JWKS_REFRESH_MIN_INTERVAL_SECS` so random-`kid` spam cannot force
+/// unbounded IdP fetches.
 const JWKS_MAX_AGE_SECS: u64 = 300;
+
+/// Minimum interval between unknown-kid forced refreshes; bounds IdP load
+/// from random-kid spam while key rotation still propagates within the
+/// interval.
+const JWKS_REFRESH_MIN_INTERVAL_SECS: u64 = 30;
 
 /// Clock-skew leeway for `exp`/`nbf` checks.
 const LEEWAY_SECS: u64 = 60;
@@ -96,6 +103,7 @@ struct Claims {
 struct JwksCache {
     keys: Vec<Jwk>,
     fetched_at: Instant,
+    last_refresh_attempt: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +113,7 @@ pub struct OidcValidator {
     jwks_uri: String,
     http: reqwest::Client,
     cache: Arc<tokio::sync::RwLock<JwksCache>>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn http_client() -> Result<reqwest::Client, OidcError> {
@@ -246,7 +255,9 @@ impl OidcValidator {
             cache: Arc::new(tokio::sync::RwLock::new(JwksCache {
                 keys: jwks.keys,
                 fetched_at: Instant::now(),
+                last_refresh_attempt: None,
             })),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -266,18 +277,51 @@ impl OidcValidator {
             cache: Arc::new(tokio::sync::RwLock::new(JwksCache {
                 keys: jwks.keys,
                 fetched_at: Instant::now(),
+                last_refresh_attempt: None,
             })),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
-    async fn refresh_jwks(&self) -> Result<(), OidcError> {
+    /// Stamp, fetch, and store a fresh JWKS. The caller must hold
+    /// `refresh_lock` so the stamp, fetch, and store are serialized
+    /// with other refreshes; the cache RwLock is never held across the
+    /// network fetch.
+    async fn fetch_and_store(&self) -> Result<(), OidcError> {
+        // Stamp even on failure: it is what throttles unknown-kid spam.
+        {
+            let mut cache = self.cache.write().await;
+            cache.last_refresh_attempt = Some(Instant::now());
+        }
         let jwks = fetch_jwks(&self.http, &self.jwks_uri).await?;
         let mut cache = self.cache.write().await;
-        *cache = JwksCache {
-            keys: jwks.keys,
-            fetched_at: Instant::now(),
-        };
+        cache.keys = jwks.keys;
+        cache.fetched_at = Instant::now();
         Ok(())
+    }
+
+    async fn refresh_jwks(&self) -> Result<(), OidcError> {
+        let _guard = self.refresh_lock.lock().await;
+        {
+            let cache = self.cache.read().await;
+            // A concurrent refresh may already have renewed the cache
+            // while this request waited on the gate; don't fetch again.
+            if cache.fetched_at.elapsed() <= Duration::from_secs(JWKS_MAX_AGE_SECS) {
+                return Ok(());
+            }
+            // Still stale with a recent attempt means that attempt failed
+            // (a success would have renewed `fetched_at`); fail closed
+            // without hammering the IdP.
+            if cache
+                .last_refresh_attempt
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(JWKS_REFRESH_MIN_INTERVAL_SECS))
+            {
+                return Err(OidcError::Jwks(
+                    "JWKS refresh throttled after recent failed attempt".to_string(),
+                ));
+            }
+        }
+        self.fetch_and_store().await
     }
 
     /// Validate a Bearer JWT and return the principal
@@ -324,12 +368,33 @@ impl OidcValidator {
                 if refreshed {
                     return Err(OidcError::UnknownKid);
                 }
-                // Fresh cache with unknown kid: force one refresh for rotation.
-                self.refresh_jwks().await?;
-                let cache = self.cache.read().await;
-                find_jwk(&cache.keys, &kid)
-                    .cloned()
-                    .ok_or(OidcError::UnknownKid)?
+                // Single-flight gate: the re-check, throttle check, stamp,
+                // and fetch are atomic with respect to other refreshes.
+                let _guard = self.refresh_lock.lock().await;
+                // A concurrent refresh may already have loaded the kid.
+                let cached = {
+                    let cache = self.cache.read().await;
+                    find_jwk(&cache.keys, &kid).cloned()
+                };
+                match cached {
+                    Some(jwk) => jwk,
+                    None => {
+                        let throttled = {
+                            let cache = self.cache.read().await;
+                            cache.last_refresh_attempt.is_some_and(|t| {
+                                t.elapsed() < Duration::from_secs(JWKS_REFRESH_MIN_INTERVAL_SECS)
+                            })
+                        };
+                        if throttled {
+                            return Err(OidcError::UnknownKid);
+                        }
+                        self.fetch_and_store().await?;
+                        let cache = self.cache.read().await;
+                        find_jwk(&cache.keys, &kid)
+                            .cloned()
+                            .ok_or(OidcError::UnknownKid)?
+                    }
+                }
             }
         };
         let key = decoding_key_for_jwk(&jwk)?;
@@ -616,6 +681,55 @@ mod tests {
         let token = encode_rs256(&base_claims(), Some("unknown-kid"));
         // Unknown kid on a fresh cache forces a JWKS refresh; the dummy
         // loopback URI fails, proving the refresh was attempted.
+        assert!(matches!(
+            validator.validate(&token).await.unwrap_err(),
+            OidcError::Jwks(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_refresh_is_throttled() {
+        let validator = test_validator();
+        let token = encode_rs256(&base_claims(), Some("unknown-kid"));
+        // First unknown-kid validate attempts a refresh against the dummy
+        // loopback URI and fails with Jwks.
+        assert!(matches!(
+            validator.validate(&token).await.unwrap_err(),
+            OidcError::Jwks(_)
+        ));
+        // Second validate within the throttle window must not fetch again;
+        // it returns UnknownKid directly.
+        assert!(matches!(
+            validator.validate(&token).await.unwrap_err(),
+            OidcError::UnknownKid
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_throttled_when_recent_attempt_prestamped() {
+        let validator = test_validator();
+        {
+            let mut cache = validator.cache.write().await;
+            cache.last_refresh_attempt = Some(Instant::now());
+        }
+        let token = encode_rs256(&base_claims(), Some("unknown-kid"));
+        assert!(matches!(
+            validator.validate(&token).await.unwrap_err(),
+            OidcError::UnknownKid
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_throttled_after_recent_failure() {
+        let validator = test_validator();
+        {
+            let mut cache = validator.cache.write().await;
+            cache.fetched_at = Instant::now() - Duration::from_secs(JWKS_MAX_AGE_SECS + 1);
+            cache.last_refresh_attempt = Some(Instant::now());
+        }
+        // Even a known kid fails closed (no stale-while-revalidate), and
+        // no new fetch is attempted within the throttle window.
+        let token = encode_rs256(&base_claims(), Some(TEST_KID));
         assert!(matches!(
             validator.validate(&token).await.unwrap_err(),
             OidcError::Jwks(_)
