@@ -1,0 +1,31 @@
+{
+  "_comment": "EXAMPLE ONLY — review and adjust prefixes/days, then apply with: aws s3api put-bucket-lifecycle-configuration --bucket REPLACE-ME-BACKUP-BUCKET --lifecycle-configuration file://bucket-lifecycle.example.json (strip this _comment key first: S3 rejects unknown fields). If dumps and packages share one bucket, merge both rules into that bucket's configuration and keep the prefixes distinct.",
+  "Rules": [
+    {
+      "ID": "postgres-dumps-expire",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "postgres/"
+      },
+      "Expiration": {
+        "Days": 30
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 7
+      }
+    },
+    {
+      "ID": "package-file-versions-prune",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "packages/"
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 90
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 7
+      }
+    }
+  ]
+}
