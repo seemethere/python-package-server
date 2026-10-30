@@ -3,10 +3,18 @@ kind: Kustomization
 namespace: packages
 resources:
   - ../../base
-# S3 overlay: file bytes live in a bucket, so pods scale past one
-# replica and the ReadWriteOnce PVC goes away (STORAGE_DIR becomes
-# per-pod upload staging on emptyDir). Before applying:
-# - replace REPLACE-ME-BUCKET below with the real bucket name;
+  - poddisruptionbudget.yaml
+# S3 overlay: the PRODUCTION default. File bytes live in a bucket, so
+# pods scale past one replica and the ReadWriteOnce PVC goes away
+# (STORAGE_DIR becomes per-pod upload staging on emptyDir). The base
+# filesystem deployment is single-node/dev only — see k8s/STORAGE.md.
+#
+# Before applying, replace BOTH placeholders below with real values:
+# - REPLACE-ME-BUCKET: the S3 bucket holding file bytes;
+# - REPLACE-ME-REGION: the bucket's region (or delete the S3_REGION
+#   entry to let the AWS SDK chain — AWS_REGION, profile, IMDS —
+#   decide instead).
+#
 # - for S3-compatible endpoints (MinIO), add an env entry
 #   S3_ENDPOINT_URL=http://minio:9000 to the container;
 # - provide credentials via the secret (AWS_ACCESS_KEY_ID /
@@ -31,11 +39,45 @@ patches:
         value:
           name: S3_BUCKET
           value: REPLACE-ME-BUCKET
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: S3_REGION
+          value: REPLACE-ME-REGION
+      # Staging buffers whole uploads on disk before transfer (default
+      # MAX_UPLOAD_BYTES is 1 GiB per upload), so cap it at 2 GiB: room
+      # for a max-size upload plus concurrent-upload headroom. Raise
+      # this limit if you raise MAX_UPLOAD_BYTES.
       - op: replace
         path: /spec/template/spec/volumes/0
         value:
           name: data
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 2Gi
+      # Spread replicas across nodes when the cluster has room; staying
+      # `preferred` (not `required`) so single-node clusters still run.
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  labelSelector:
+                    matchLabels:
+                      app: package-server
+                  topologyKey: kubernetes.io/hostname
+      # Spread replicas across zones on multi-zone clusters; single-zone
+      # clusters are unaffected (`ScheduleAnyway` never blocks).
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app: package-server
   - target:
       kind: PersistentVolumeClaim
       name: package-server-data
