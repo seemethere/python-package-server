@@ -17,28 +17,31 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-# Cacher: compile all third-party dependencies into image layers. Warm CI
-# builds restore these layers from the GHA cache (mode=max), skipping the
-# dependency compile entirely.
-FROM chef AS cacher
+# Builder: cook all third-party dependencies, then compile only the
+# workspace crates. Warm CI builds restore the cook layer from the
+# registry cache (see .github/workflows/ci.yml), skipping the dependency
+# compile entirely.
+#
+# Cook and build live in one stage on purpose: the cooked target/ and
+# the cargo registry stay in this stage's own layer chain. Splitting
+# them into a sibling "cacher" stage forced COPY --from layers of the
+# whole target dir and cargo home into the builder, so every warm build
+# downloaded and extracted the same artifacts several times over, and
+# mode=max exported each duplicate to the cache.
+#
+# NOTE: no BuildKit cache mounts here on purpose. Cooked deps live in
+# layers (restored via the registry cache), and a target-dir mount would
+# shadow the cooked artifacts while adding export/import overhead — the
+# mounts were the old bottleneck, layers replace them.
+FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Cargo.lock pins the exact tree chef cooks, and a lockfile-only change
 # (e.g. `cargo update`) still invalidates this layer, so the cooked deps
 # always match the final `cargo build --locked` resolution.
 COPY Cargo.lock ./
 RUN cargo chef cook --release --locked --recipe-path recipe.json
-
-# Builder: reuse the cooked dependency artifacts, then compile only the
-# workspace crates. Needs the real source AND ./migrations at compile
-# time (sqlx::migrate! embeds them).
-#
-# NOTE: no BuildKit cache mounts here on purpose. Cooked deps live in
-# layers (restored via the GHA cache), and a target-dir mount would shadow
-# the copied /app/target artifacts while adding GHA export/import
-# overhead — the mounts were the old bottleneck, layers replace them.
-FROM chef AS builder
-COPY --from=cacher /app/target target
-COPY --from=cacher /usr/local/cargo /usr/local/cargo
+# Needs the real source AND ./migrations at compile time
+# (sqlx::migrate! embeds them).
 COPY . .
 RUN cargo build --release --locked
 
