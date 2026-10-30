@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: package-server
+  annotations:
+    # cert-manager provisions the `packages-tls` certificate from this
+    # issuer. Replace REPLACE-ME-CLUSTER-ISSUER with your real ClusterIssuer
+    # name (e.g. letsencrypt-prod), or swap this annotation for your
+    # ingress controller's own TLS mechanism.
+    cert-manager.io/cluster-issuer: REPLACE-ME-CLUSTER-ISSUER
+spec:
+  tls:
+    - hosts:
+        - packages.example.com
+      secretName: packages-tls
+  rules:
+    - host: packages.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: package-server
+                port:
+                  number: 8000

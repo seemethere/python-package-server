@@ -361,6 +361,8 @@ Notes:
 - For S3-backed storage, build `k8s/overlays/s3` instead: 2 replicas, no
   PVC (staging is per-pod `emptyDir`), `STORAGE_BACKEND=s3`. Set the real
   bucket name in the overlay first (see its comments).
+- For production Postgres + TLS ingress, build `k8s/overlays/prod` (see its
+  [README](./k8s/overlays/prod/README.md)).
 - Probes: startup/readiness use deep `GET /health`; liveness uses shallow
   `GET /live` so a database outage marks the pod unready without restarting it.
 - Storage choice (S3 is the production default; base filesystem is
