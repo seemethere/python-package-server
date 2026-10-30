@@ -143,9 +143,48 @@ fn find_jwk<'a>(keys: &'a [Jwk], kid: &str) -> Option<&'a Jwk> {
     keys.iter().find(|k| k.kid.as_deref() == Some(kid))
 }
 
-fn decoding_key_for_jwk(jwk: &Jwk) -> Result<jsonwebtoken::DecodingKey, OidcError> {
+fn validate_jwks_uri(issuer: &str, jwks_uri: &str) -> Result<(), OidcError> {
+    if issuer.starts_with("https://") && !jwks_uri.starts_with("https://") {
+        return Err(OidcError::Discovery(format!(
+            "jwks_uri '{jwks_uri}' must use https when issuer uses https"
+        )));
+    }
+    Ok(())
+}
+
+fn is_insecure_remote_issuer(issuer: &str) -> bool {
+    let Some(rest) = issuer.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = if host_port.starts_with('[') {
+        match host_port.find(']') {
+            Some(end) => &host_port[..=end],
+            None => host_port,
+        }
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    !(host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]")
+}
+
+fn decoding_key_for_jwk(
+    jwk: &Jwk,
+    alg: jsonwebtoken::Algorithm,
+) -> Result<jsonwebtoken::DecodingKey, OidcError> {
     match jwk.kty.as_str() {
         "RSA" => {
+            if !matches!(
+                alg,
+                jsonwebtoken::Algorithm::RS256
+                    | jsonwebtoken::Algorithm::RS384
+                    | jsonwebtoken::Algorithm::RS512
+            ) {
+                return Err(OidcError::Key(format!(
+                    "RSA JWK alg mismatch: token alg {alg:?} requires an RSA key with RS256/RS384/RS512"
+                )));
+            }
             let n = jwk
                 .n
                 .as_deref()
@@ -159,8 +198,15 @@ fn decoding_key_for_jwk(jwk: &Jwk) -> Result<jsonwebtoken::DecodingKey, OidcErro
         }
         "EC" => {
             let crv = jwk.crv.as_deref().unwrap_or("");
-            if crv != "P-256" && crv != "P-384" {
-                return Err(OidcError::Key(format!("unsupported EC crv '{crv}'")));
+            let binding_ok = matches!(
+                (alg, crv),
+                (jsonwebtoken::Algorithm::ES256, "P-256")
+                    | (jsonwebtoken::Algorithm::ES384, "P-384")
+            );
+            if !binding_ok {
+                return Err(OidcError::Key(format!(
+                    "EC JWK crv '{crv}' alg mismatch: token alg {alg:?} requires ES256 with P-256 or ES384 with P-384"
+                )));
             }
             let x = jwk
                 .x
@@ -225,6 +271,12 @@ impl OidcValidator {
     /// Discover the issuer and fetch JWKS once, failing fast at startup.
     pub async fn new(issuer: &str, audience: &str) -> Result<Self, OidcError> {
         let issuer = issuer.trim_end_matches('/');
+        if is_insecure_remote_issuer(issuer) {
+            tracing::warn!(
+                issuer = %issuer,
+                "OIDC issuer uses plaintext http:// for a remote host; discovery and JWKS travel unencrypted and key substitution is possible"
+            );
+        }
         let http = http_client()?;
         let discovery_url = format!("{issuer}/.well-known/openid-configuration");
         let response = http
@@ -246,6 +298,7 @@ impl OidcValidator {
                 actual: doc.issuer,
             });
         }
+        validate_jwks_uri(issuer, &doc.jwks_uri)?;
         let jwks = fetch_jwks(&http, &doc.jwks_uri).await?;
         Ok(Self {
             issuer: issuer.to_string(),
@@ -397,7 +450,7 @@ impl OidcValidator {
                 }
             }
         };
-        let key = decoding_key_for_jwk(&jwk)?;
+        let key = decoding_key_for_jwk(&jwk, header.alg)?;
         let mut validation = jsonwebtoken::Validation::new(header.alg);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         validation.set_issuer(&[self.issuer.as_str()]);
@@ -785,6 +838,108 @@ mod tests {
         claims["nbf"] = serde_json::json!(now_secs() + 3600);
         let token = encode_value(&claims, Some(TEST_KID));
         assert!(validator.validate(&token).await.is_err());
+    }
+
+    #[test]
+    fn ec_p384_jwk_with_es256_fails_binding() {
+        let jwk = Jwk {
+            kid: Some("ec-key".to_string()),
+            kty: "EC".to_string(),
+            n: None,
+            e: None,
+            x: Some("AAAA".to_string()),
+            y: Some("AAAA".to_string()),
+            crv: Some("P-384".to_string()),
+        };
+        let err = decoding_key_for_jwk(&jwk, jsonwebtoken::Algorithm::ES256)
+            .err()
+            .expect("expected binding error");
+        assert!(
+            matches!(err, OidcError::Key(_)),
+            "expected Key, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("mismatch"),
+            "error should mention mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rsa_jwk_with_es256_fails_binding() {
+        let jwk = Jwk {
+            kid: Some(TEST_KID.to_string()),
+            kty: "RSA".to_string(),
+            n: Some(TEST_N.to_string()),
+            e: Some("AQAB".to_string()),
+            x: None,
+            y: None,
+            crv: None,
+        };
+        let err = decoding_key_for_jwk(&jwk, jsonwebtoken::Algorithm::ES256)
+            .err()
+            .expect("expected binding error");
+        assert!(
+            matches!(err, OidcError::Key(_)),
+            "expected Key, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("mismatch"),
+            "error should mention mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ec_p256_jwk_with_es256_does_not_fail_binding() {
+        let jwk = Jwk {
+            kid: Some("ec-key".to_string()),
+            kty: "EC".to_string(),
+            n: None,
+            e: None,
+            x: Some("AAAA".to_string()),
+            y: Some("AAAA".to_string()),
+            crv: Some("P-256".to_string()),
+        };
+        // Binding (ES256 + P-256) must pass; dummy components may fail
+        // later inside DecodingKey construction, but not with the
+        // binding-mismatch error.
+        if let Err(err) = decoding_key_for_jwk(&jwk, jsonwebtoken::Algorithm::ES256) {
+            assert!(
+                !err.to_string().contains("mismatch"),
+                "P-256/ES256 should not fail binding, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_jwks_uri_pins_https_for_https_issuer() {
+        assert!(matches!(
+            validate_jwks_uri(
+                "https://issuer.example.com",
+                "http://issuer.example.com/jwks"
+            )
+            .unwrap_err(),
+            OidcError::Discovery(_)
+        ));
+        assert!(validate_jwks_uri(
+            "https://issuer.example.com",
+            "https://issuer.example.com/jwks"
+        )
+        .is_ok());
+        assert!(validate_jwks_uri(
+            "http://issuer.example.com",
+            "http://issuer.example.com/jwks"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn insecure_remote_issuer_detection() {
+        assert!(is_insecure_remote_issuer("http://issuer.example.com"));
+        assert!(!is_insecure_remote_issuer("http://localhost:8080/auth"));
+        assert!(!is_insecure_remote_issuer("http://127.0.0.1:9000"));
+        assert!(!is_insecure_remote_issuer("https://issuer.example.com"));
+        assert!(!is_insecure_remote_issuer("http://[::1]:8080/auth"));
+        assert!(!is_insecure_remote_issuer("http://localhost/auth"));
     }
 
     #[tokio::test]
