@@ -327,7 +327,8 @@ cargo run
 ## Kubernetes
 
 Manifests live in [k8s/](./k8s/) (Kustomize). The image defaults to
-`ghcr.io/REPLACE-ME/python-package-server:0.1.0` — replace with your registry.
+`ghcr.io/seemethere/python-package-server:latest`, published by CI —
+see [docs/image-publishing.md](./docs/image-publishing.md).
 
 1. Create the real secret out-of-band (see
    [k8s/secret.example.yaml](./k8s/secret.example.yaml); never commit it):
